@@ -125,6 +125,37 @@ fn gcd(a int, b int) int {
 	return gcd(b, a % b)
 }
 
+// Multi-return functions
+fn swap(a int, b int) (int, int) {
+	return b, a
+}
+
+fn divmod(a int, b int) (int, int) {
+	return a / b, a % b
+}
+
+fn min_max(a int, b int, c int) (int, int) {
+	mut min := a
+	mut max := a
+	if b < min {
+		min = b
+	}
+	if b > max {
+		max = b
+	}
+	if c < min {
+		min = c
+	}
+	if c > max {
+		max = c
+	}
+	return min, max
+}
+
+fn triple_return(x int) (int, int, int) {
+	return x, x * 2, x * 3
+}
+
 fn power(base int, exp int) int {
 	if exp == 0 {
 		return 1
@@ -236,6 +267,9 @@ fn print_str(s string) {
 	C.puts(s.str)
 }
 
+// C function with keyword name (tests parser allowing keywords after C.)
+fn C.select(ndfs int, readfds voidptr, writefds voidptr, exceptfds voidptr, timeout voidptr) int
+
 fn nested_return(x int) int {
 	if x < 10 {
 		return 100
@@ -288,6 +322,18 @@ fn defer_order_test() {
 	}
 }
 
+// Helper function to test defer(fn) - function-level defer
+fn defer_fn_test() int {
+	mut x := 0
+	for i := 0; i < 3; i++ {
+		defer(fn) {
+			x += 100
+		}
+		x += 1
+	}
+	return x // returns 3, but defer(fn) adds 300 at function end
+}
+
 // ===================== IF-GUARD HELPERS =====================
 
 // Returns the value if positive, none otherwise
@@ -312,6 +358,12 @@ fn maybe_sum(a int, b int) ?int {
 		return a + b
 	}
 	return none
+}
+
+// Uses `or { return }` pattern to propagate none
+fn maybe_triple(x int) ?int {
+	val := maybe_positive(x) or { return none }
+	return val * 3
 }
 
 // ===================== IF-EXPRESSION HELPERS =====================
@@ -1846,6 +1898,20 @@ fn main() {
 		}
 	}
 
+	// 35.8 or { return } pattern with value
+	if or_val := maybe_triple(5) {
+		print_int(or_val) // 15 (5 * 3)
+	} else {
+		print_int(-1)
+	}
+
+	// 35.9 or { return } pattern with negative (returns none)
+	if or_val2 := maybe_triple(-5) {
+		print_int(or_val2)
+	} else {
+		print_int(0) // 0 (none case)
+	}
+
 	// ==================== 36. RANGE EXPRESSIONS ====================
 	print_str('--- 36. Range Expressions ---')
 
@@ -1979,6 +2045,9 @@ fn main() {
 
 	// 38.5 Test defer order in function
 	defer_order_test() // Should print: Third, Second, First
+
+	// 38.6 Test defer(fn) - function-level defer
+	print_int(defer_fn_test()) // 303 (3 from loop + 300 from function-level defers)
 
 	// ==================== 39. ENUMS ====================
 	print_str('--- 39. Enums ---')
@@ -2269,6 +2338,438 @@ fn main() {
 		unsafe_pt.x + unsafe_pt.y
 	}
 	print_int(unsafe_sum) // 40
+
+	// ==================== 47. INTERFACE VTABLE ====================
+	print_str('--- 47. Interface Vtable ---')
+
+	// 47.1 Basic interface assignment and method call
+	vtable_pt1 := Point{
+		x: 7
+		y: 3
+	}
+	d1 := Drawable(vtable_pt1)
+	print_int(d1.draw()) // 7*1000 + 3 = 7003
+
+	// 47.2 Interface with different values
+	vtable_pt2 := Point{
+		x: 15
+		y: 25
+	}
+	d2 := Drawable(vtable_pt2)
+	print_int(d2.draw()) // 15*1000 + 25 = 15025
+
+	// 47.3 Multiple interface calls
+	vtable_pt3 := Point{
+		x: 1
+		y: 1
+	}
+	d3 := Drawable(vtable_pt3)
+	print_int(d3.draw() + d3.draw()) // 1001 + 1001 = 2002
+
+	// 47.4 Shape interface with multiple methods
+	shape_rect := Rectangle{
+		width:  10
+		height: 5
+		origin: Point{
+			x: 0
+			y: 0
+		}
+	}
+	shape1 := Shape(shape_rect)
+	print_int(shape1.area()) // 10 * 5 = 50
+	print_int(shape1.perimeter()) // 2 * (10 + 5) = 30
+
+	// 47.5 Sum of interface method results
+	vtable_pt4 := Point{
+		x: 2
+		y: 3
+	}
+	d4 := Drawable(vtable_pt4)
+	vtable_pt5 := Point{
+		x: 4
+		y: 5
+	}
+	d5 := Drawable(vtable_pt5)
+	print_int(d4.draw() + d5.draw()) // 2003 + 4005 = 6008
+
+	// ==================== 48. STRUCT FIELD OPERATIONS ====================
+	print_str('--- 48. Struct Field Operations ---')
+
+	// 48.1 Basic field assignment with arithmetic
+	mut sf1 := Point{
+		x: 10
+		y: 20
+	}
+	sf1.x = sf1.x + 5
+	sf1.y = sf1.y - 3
+	print_int(sf1.x) // 15
+	print_int(sf1.y) // 17
+
+	// 48.2 Field multiplication and division
+	mut sf2 := Point{
+		x: 6
+		y: 100
+	}
+	sf2.x = sf2.x * 7
+	sf2.y = sf2.y / 4
+	print_int(sf2.x) // 42
+	print_int(sf2.y) // 25
+
+	// 48.3 Compound assignment on fields
+	mut sf3 := Point{
+		x: 50
+		y: 30
+	}
+	sf3.x += 25
+	sf3.y -= 10
+	print_int(sf3.x) // 75
+	print_int(sf3.y) // 20
+
+	// 48.4 Compound multiply/divide on fields
+	mut sf4 := Point{
+		x: 8
+		y: 64
+	}
+	sf4.x *= 5
+	sf4.y /= 8
+	print_int(sf4.x) // 40
+	print_int(sf4.y) // 8
+
+	// 48.5 Field used in expression with other field
+	mut sf5 := Point{
+		x: 3
+		y: 4
+	}
+	sf5.x = sf5.x + sf5.y
+	sf5.y = sf5.x * sf5.y
+	print_int(sf5.x) // 7 (3+4)
+	print_int(sf5.y) // 28 (7*4)
+
+	// 48.6 Chained field operations
+	mut sf6 := Point{
+		x: 2
+		y: 3
+	}
+	sf6.x = sf6.x * 2
+	sf6.x = sf6.x + 1
+	sf6.x = sf6.x * 3
+	sf6.y = sf6.y + sf6.x
+	print_int(sf6.x) // 15 ((2*2+1)*3)
+	print_int(sf6.y) // 18 (3+15)
+
+	// 48.7 Field modulo operation
+	mut sf7 := Point{
+		x: 17
+		y: 23
+	}
+	sf7.x = sf7.x % 5
+	sf7.y = sf7.y % 7
+	print_int(sf7.x) // 2
+	print_int(sf7.y) // 2
+
+	// 48.8 Field bitwise operations
+	mut sf8 := Point{
+		x: 0b1100
+		y: 0b1010
+	}
+	sf8.x = sf8.x & sf8.y
+	sf8.y = sf8.x | 0b0101
+	print_int(sf8.x) // 8 (0b1000)
+	print_int(sf8.y) // 13 (0b1101)
+
+	// 48.9 Field with function call result
+	mut sf9 := Point{
+		x: 5
+		y: 10
+	}
+	sf9.x = add(sf9.x, sf9.y)
+	sf9.y = mul(sf9.x, 2)
+	print_int(sf9.x) // 15
+	print_int(sf9.y) // 30
+
+	// 48.10 Nested struct field modification
+	mut rect_mod := Rectangle{
+		width:  10
+		height: 20
+		origin: Point{
+			x: 0
+			y: 0
+		}
+	}
+	rect_mod.width = rect_mod.width * 2
+	rect_mod.height += 5
+	rect_mod.origin.x = 100
+	rect_mod.origin.y = rect_mod.origin.x / 2
+	print_int(rect_mod.width) // 20
+	print_int(rect_mod.height) // 25
+	print_int(rect_mod.origin.x) // 100
+	print_int(rect_mod.origin.y) // 50
+
+	// ==================== 49. PRINTLN ====================
+	print_str('--- 49. Println ---')
+
+	// 49.1 Test println
+	println('hello world')
+
+	// ==================== 50. ALGEBRAIC OPTIMIZATIONS ====================
+	print_str('--- 50. Algebraic Optimizations ---')
+
+	// 50.1 x - x = 0
+	opt_val := 42
+	print_int(opt_val - opt_val) // 0
+
+	// 50.2 x ^ x = 0
+	opt_xor := 123
+	print_int(opt_xor ^ opt_xor) // 0
+
+	// 50.3 x & x = x
+	opt_and := 99
+	print_int(opt_and & opt_and) // 99
+
+	// 50.4 x | x = x
+	opt_or := 77
+	print_int(opt_or | opt_or) // 77
+
+	// 50.5 x * 2 = x << 1
+	opt_mul2 := 25
+	print_int(opt_mul2 * 2) // 50
+
+	// 50.6 Combined optimizations
+	opt_a := 10
+	opt_b := opt_a - opt_a // Should be 0
+	opt_c := opt_a | opt_a // Should be 10
+	print_int(opt_b) // 0
+	print_int(opt_c) // 10
+
+	// 50.7 2 * x = x << 1 (commutative)
+	opt_mul2_comm := 13
+	print_int(2 * opt_mul2_comm) // 26
+
+	// 50.8 Algebraic opts in expressions
+	opt_expr := 7
+	print_int((opt_expr ^ opt_expr) + 5) // 0 + 5 = 5
+	print_int((opt_expr & opt_expr) * 2) // 7 * 2 = 14
+
+	// 50.9 Algebraic opts with different values
+	opt_large := 12345
+	print_int(opt_large - opt_large) // 0
+	print_int(opt_large ^ opt_large) // 0
+	print_int(opt_large & opt_large) // 12345
+	print_int(opt_large | opt_large) // 12345
+
+	// 50.10 Algebraic opts in loop
+	mut opt_loop_sum := 0
+	for i in 1 .. 5 {
+		opt_loop_sum += i - i // Should add 0 each iteration
+		opt_loop_sum += i & i // Should add i each iteration
+	}
+	print_int(opt_loop_sum) // 0+1 + 0+2 + 0+3 + 0+4 = 10
+
+	// ==================== 51. DEAD STORE ELIMINATION ====================
+	print_str('--- 51. Dead Store Elimination ---')
+
+	// 51.1 Basic dead store - local var never read
+	// The optimizer should remove stores to variables that are never used
+	{
+		mut dead_var := 100
+		dead_var = 200 // dead store, never read
+		_ = dead_var
+	}
+	print_int(1) // 1 - verify execution continues
+
+	// 51.2 Dead store with live store after
+	mut dse_var := 10
+	dse_var = 20 // dead store (overwritten before read)
+	dse_var = 30 // this is the live store
+	print_int(dse_var) // 30
+
+	// 51.3 Multiple dead stores
+	mut dse_multi := 1
+	dse_multi = 2 // dead
+	dse_multi = 3 // dead
+	dse_multi = 4 // dead
+	dse_multi = 5 // live
+	print_int(dse_multi) // 5
+
+	// 51.4 Dead store in branch not taken
+	mut dse_branch := 100
+	if false {
+		dse_branch = 999 // dead (branch never taken)
+	}
+	print_int(dse_branch) // 100
+
+	// 51.5 Live store in taken branch
+	mut dse_live := 50
+	if true {
+		dse_live = 75
+	}
+	print_int(dse_live) // 75
+
+	// ==================== 52. DEAD PHI ELIMINATION ====================
+	print_str('--- 52. Dead Phi Elimination ---')
+
+	// 52.1 Phi from if-else where result is unused
+	// The phi node should be eliminated if not used
+	mut phi_unused := 0
+	if true {
+		phi_unused = 10
+	} else {
+		phi_unused = 20
+	}
+	// phi_unused is reassigned, so previous phi is dead
+	phi_unused = 99
+	print_int(phi_unused) // 99
+
+	// 52.2 Multiple phi nodes, some dead
+	mut phi_a := 0
+	mut phi_b := 0
+	if true {
+		phi_a = 1
+		phi_b = 2
+	} else {
+		phi_a = 3
+		phi_b = 4
+	}
+	// phi_b is dead (overwritten), phi_a is live
+	phi_b = 100
+	print_int(phi_a) // 1
+	print_int(phi_b) // 100
+
+	// 52.3 Loop phi - variable assigned in loop body
+	mut phi_loop := 0
+	for i in 0 .. 3 {
+		phi_loop = i // intermediate values are dead, only final matters
+	}
+	print_int(phi_loop) // 2 (last iteration value)
+
+	// 52.4 Nested if with dead phi
+	mut phi_nested := 0
+	if true {
+		if true {
+			phi_nested = 10
+		} else {
+			phi_nested = 20
+		}
+		phi_nested = 30 // overwrites inner phi result
+	}
+	print_int(phi_nested) // 30
+
+	// 52.5 Complex phi scenario with loop and conditionals
+	mut phi_complex := 1
+	for i in 0 .. 4 {
+		if i % 2 == 0 {
+			phi_complex = phi_complex + 1
+		} else {
+			phi_complex = phi_complex * 2
+		}
+	}
+	print_int(phi_complex) // 1 -> 2 -> 4 -> 5 -> 10
+
+	// ==================== 53. CONSTANT DEDUPLICATION ====================
+	print_str('--- 53. Constant Deduplication ---')
+
+	// 53.1 Same constant used multiple times
+	const_a := 42
+	const_b := 42
+	const_c := 42
+	print_int(const_a + const_b + const_c) // 126
+
+	// 53.2 Zero constant deduplication
+	zero1 := 0
+	zero2 := 0
+	zero3 := 0
+	print_int(zero1 + zero2 + zero3) // 0
+
+	// 53.3 Constant from algebraic opts should be deduplicated
+	dedup_x := 50
+	result1 := dedup_x - dedup_x // creates zero
+	dedup_y := 60
+	result2 := dedup_y - dedup_y // should reuse same zero
+	print_int(result1 + result2) // 0
+
+	// 53.4 Multiple shifts with same constant
+	shift_a := 1
+	shift_b := 2
+	shift_c := 4
+	// All these use constant 1 for the shift amount when x*2 is optimized
+	print_int(shift_a * 2 + shift_b * 2 + shift_c * 2) // 2 + 4 + 8 = 14
+
+	// 53.5 Constants in expressions
+	expr_const := (10 + 10) * (5 + 5) // Both 10s and 5s should be deduplicated
+	print_int(expr_const) // 200
+
+	// ==================== 54. HASHMAPS ====================
+	print_str('--- 54. Hashmaps ---')
+
+	// 54.1 Basic map initialization and assignment
+	mut hm1 := map[int]int{}
+	hm1[1] = 10
+	hm1[2] = 20
+	hm1[3] = 30
+	print_int(hm1[1]) // 10
+	print_int(hm1[2]) // 20
+	print_int(hm1[3]) // 30
+
+	// 54.2 Map len
+	print_int(hm1.len) // 3
+
+	// 54.3 Map with different keys
+	mut hm2 := map[int]int{}
+	hm2[100] = 1000
+	hm2[200] = 2000
+	print_int(hm2[100]) // 1000
+	print_int(hm2[200]) // 2000
+	print_int(hm2.len) // 2
+
+	// 54.4 Map value update
+	mut hm3 := map[int]int{}
+	hm3[5] = 50
+	print_int(hm3[5]) // 50
+	hm3[5] = 500
+	print_int(hm3[5]) // 500
+	print_int(hm3.len) // 1 (still 1, not 2)
+
+	// 54.5 Map with computed values
+	mut hm4 := map[int]int{}
+	for i in 0 .. 5 {
+		hm4[i] = i * i
+	}
+	print_int(hm4[0]) // 0
+	print_int(hm4[1]) // 1
+	print_int(hm4[2]) // 4
+	print_int(hm4[3]) // 9
+	print_int(hm4[4]) // 16
+
+	// ==================== 55. MULTI-RETURN ====================
+	print_str('--- 55. Multi-return ---')
+
+	// 55.1 Basic two-value return
+	a1, b1 := swap(10, 20)
+	print_int(a1) // 20
+	print_int(b1) // 10
+
+	// 55.2 Division and modulo
+	quot, rem := divmod(17, 5)
+	print_int(quot) // 3
+	print_int(rem) // 2
+
+	// 55.3 Min/max of three values
+	min1, max1 := min_max(5, 2, 8)
+	print_int(min1) // 2
+	print_int(max1) // 8
+
+	// 55.4 Three-value return
+	t1, t2, t3 := triple_return(7)
+	print_int(t1) // 7
+	print_int(t2) // 14
+	print_int(t3) // 21
+
+	// 55.5 Ignore some return values with _
+	_, only_rem := divmod(23, 4)
+	print_int(only_rem) // 3
+
+	only_quot, _ := divmod(23, 4)
+	print_int(only_quot) // 5
 
 	print_str('=== All tests completed ===')
 }

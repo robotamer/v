@@ -6,12 +6,12 @@ module builder
 import os
 import v2.ast
 import v2.gen.arm64
-import v2.gen.c
 import v2.gen.cleanc
 import v2.gen.v as gen_v
 import v2.gen.x64
 import v2.pref
 import v2.ssa
+import v2.ssa.optimize
 import v2.token
 import v2.transform
 import time
@@ -19,8 +19,9 @@ import time
 struct Builder {
 	pref &pref.Preferences
 mut:
-	files    []ast.File
-	file_set &token.FileSet = token.FileSet.new()
+	files      []ast.File
+	user_files []string // original user-provided files (for output name)
+	file_set   &token.FileSet = token.FileSet.new()
 }
 
 pub fn new_builder(prefs &pref.Preferences) &Builder {
@@ -32,6 +33,7 @@ pub fn new_builder(prefs &pref.Preferences) &Builder {
 }
 
 pub fn (mut b Builder) build(files []string) {
+	b.user_files = files
 	mut sw := time.new_stopwatch()
 	b.files = if b.pref.no_parallel {
 		b.parse_files(files)
@@ -52,9 +54,6 @@ pub fn (mut b Builder) build(files []string) {
 		}
 		.cleanc {
 			b.gen_cleanc()
-		}
-		.c {
-			b.gen_ssa_c()
 		}
 		.x64 {
 			b.gen_native(.x64)
@@ -87,63 +86,60 @@ fn (mut b Builder) gen_v_files() {
 
 fn (mut b Builder) gen_cleanc() {
 	// Clean C Backend (AST -> C)
+	// Cleanc has its own minimal runtime - only pass user files, not builtin
+	mut user_files := []ast.File{}
 	for file in b.files {
-		mut gen := cleanc.Gen.new(file)
-		c_source := gen.gen()
-
-		output_file := if b.pref.output_file != '' {
-			b.pref.output_file
-		} else {
-			'out.c'
+		// Skip builtin/stdlib files - they are identified by path
+		if file.name.contains('vlib/builtin') || file.name.contains('vlib/strconv')
+			|| file.name.contains('vlib/strings') || file.name.contains('vlib/hash')
+			|| file.name.contains('vlib/math') {
+			continue
 		}
-		os.write_file(output_file, c_source) or { panic(err) }
-
-		if b.pref.verbose {
-			println('[*] Wrote ${output_file}')
-		}
+		user_files << file
 	}
-}
 
-fn (mut b Builder) gen_ssa_c() {
-	// SSA -> C Backend - build all files into a single module
-	mut mod := ssa.Module.new('main')
-	mut ssa_builder := ssa.Builder.new(mod)
-	mut t := transform.Transformer.new()
-
-	for file in b.files {
-		transformed_file := t.transform(file)
-		ssa_builder.build(transformed_file)
-	}
-	mod.optimize()
-
-	mut gen := c.Gen.new(mod)
+	mut gen := cleanc.Gen.new(user_files)
 	c_source := gen.gen()
 
-	c_file := 'out.c'
-	os.write_file(c_file, c_source) or { panic(err) }
-
-	if b.pref.verbose {
-		println('[*] Wrote ${c_file}')
-	}
-
-	// Compile C to binary
-	output_binary := if b.pref.output_file != '' {
+	// Determine output name
+	output_name := if b.pref.output_file != '' {
 		b.pref.output_file
-	} else if b.files.len > 0 {
-		os.file_name(b.files.last().name).all_before_last('.v')
+	} else if b.user_files.len > 0 {
+		os.file_name(b.user_files.last()).all_before_last('.v')
 	} else {
 		'out'
 	}
 
-	cc_result := os.execute('cc -o ${output_binary} ${c_file}')
-	if cc_result.exit_code != 0 {
-		eprintln('C compilation failed:')
-		eprintln(cc_result.output)
-		exit(1)
-	}
+	// If output ends with .c, just write the C file
+	if output_name.ends_with('.c') {
+		os.write_file(output_name, c_source) or { panic(err) }
+		if b.pref.verbose {
+			println('[*] Wrote ${output_name}')
+		}
+	} else {
+		// Write to temp .c file, compile to binary, then clean up
+		c_file := output_name + '.c'
+		os.write_file(c_file, c_source) or { panic(err) }
 
-	if b.pref.verbose {
-		println('[*] Compiled ${output_binary}')
+		if b.pref.verbose {
+			println('[*] Wrote ${c_file}')
+		}
+
+		// Compile C to binary
+		cc := os.getenv_opt('CC') or { 'cc' }
+		compile_result := os.execute('${cc} ${c_file} -o ${output_name} -w')
+		if compile_result.exit_code != 0 {
+			eprintln('C compilation failed:')
+			eprintln(compile_result.output)
+			exit(1)
+		}
+
+		if b.pref.verbose {
+			println('[*] Compiled ${output_name}')
+		}
+
+		// Clean up temp C file
+		os.rm(c_file) or {}
 	}
 }
 
@@ -155,17 +151,23 @@ fn (mut b Builder) gen_native(backend_arch pref.Arch) {
 	mut ssa_builder := ssa.Builder.new(mod)
 	mut t := transform.Transformer.new()
 
+	// Transform all files first
+	mut transformed_files := []ast.File{}
 	for file in b.files {
-		transformed_file := t.transform(file)
-		ssa_builder.build(transformed_file)
+		transformed_files << t.transform(file)
 	}
-	mod.optimize()
+	// Build all files together with proper multi-file ordering
+	ssa_builder.build_all(transformed_files)
+	optimize.optimize(mut mod)
+	$if debug {
+		optimize.verify_and_panic(mod, 'full optimization')
+	}
 
 	// Determine output binary name from the last user file
 	output_binary := if b.pref.output_file != '' {
 		b.pref.output_file
-	} else if b.files.len > 0 {
-		os.file_name(b.files.last().name).all_before_last('.v')
+	} else if b.user_files.len > 0 {
+		os.file_name(b.user_files.last()).all_before_last('.v')
 	} else {
 		'out'
 	}
