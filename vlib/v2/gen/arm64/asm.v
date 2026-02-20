@@ -139,6 +139,19 @@ fn asm_lsrv(rd Reg, rn Reg, rm Reg) u32 {
 	return 0x9AC02400 | (u32(rm) << 16) | (u32(rn) << 5) | u32(rd)
 }
 
+// lsr xd, xn, #shift (logical shift right immediate, 64-bit)
+// Alias for UBFM Xd, Xn, #shift, #63
+fn asm_lsr_imm(rd Reg, rn Reg, shift u32) u32 {
+	return 0xD340FC00 | ((shift & 0x3F) << 16) | (u32(rn) << 5) | u32(rd)
+}
+
+// ubfx xd, xn, #0, #width  (unsigned bitfield extract, zero-extend lower bits)
+// Alias for UBFM Xd, Xn, #0, #(width-1)
+fn asm_ubfx_lower(rd Reg, rn Reg, width u32) u32 {
+	imms := (width - 1) & 0x3F
+	return 0xD3400000 | (imms << 10) | (u32(rn) << 5) | u32(rd)
+}
+
 // === Compare ===
 
 // cmp rn, rm (subs xzr, rn, rm)
@@ -185,14 +198,44 @@ fn asm_str(rt Reg, rn Reg) u32 {
 	return 0xF9000000 | (u32(rn) << 5) | u32(rt)
 }
 
+// str wt, [rn] (store 32-bit)
+fn asm_str_w(rt Reg, rn Reg) u32 {
+	return 0xB9000000 | (u32(rn) << 5) | u32(rt)
+}
+
+// strh wt, [rn] (store 16-bit)
+fn asm_str_h(rt Reg, rn Reg) u32 {
+	return 0x79000000 | (u32(rn) << 5) | u32(rt)
+}
+
+// strb wt, [rn] (store 8-bit)
+fn asm_str_b(rt Reg, rn Reg) u32 {
+	return 0x39000000 | (u32(rn) << 5) | u32(rt)
+}
+
 // str rt, [rn, #imm12] (scaled by 8)
 fn asm_str_imm(rt Reg, rn Reg, imm12 u32) u32 {
 	return 0xF9000000 | (imm12 << 10) | (u32(rn) << 5) | u32(rt)
 }
 
-// str rt, [rn, #simm9] (unscaled)
+// stur xt, [xn, #simm9] (unscaled 64-bit store)
 fn asm_stur(rt Reg, rn Reg, simm9 i32) u32 {
 	return 0xF8000000 | (u32(simm9 & 0x1FF) << 12) | (u32(rn) << 5) | u32(rt)
+}
+
+// stur wt, [xn, #simm9] (unscaled 32-bit store)
+fn asm_stur_w(rt Reg, rn Reg, simm9 i32) u32 {
+	return 0xB8000000 | (u32(simm9 & 0x1FF) << 12) | (u32(rn) << 5) | u32(rt)
+}
+
+// sturh wt, [xn, #simm9] (unscaled 16-bit store)
+fn asm_stur_h(rt Reg, rn Reg, simm9 i32) u32 {
+	return 0x78000000 | (u32(simm9 & 0x1FF) << 12) | (u32(rn) << 5) | u32(rt)
+}
+
+// sturb wt, [xn, #simm9] (unscaled 8-bit store)
+fn asm_stur_b(rt Reg, rn Reg, simm9 i32) u32 {
+	return 0x38000000 | (u32(simm9 & 0x1FF) << 12) | (u32(rn) << 5) | u32(rt)
 }
 
 // ldr rt, [rn] (load 64-bit)
@@ -200,9 +243,45 @@ fn asm_ldr(rt Reg, rn Reg) u32 {
 	return 0xF9400000 | (u32(rn) << 5) | u32(rt)
 }
 
-// ldr rt, [rn, #simm9] (unscaled)
+// ldr wt, [rn] (load 32-bit, zero-extend to x)
+fn asm_ldr_w(rt Reg, rn Reg) u32 {
+	return 0xB9400000 | (u32(rn) << 5) | u32(rt)
+}
+
+// ldrh wt, [rn] (load 16-bit, zero-extend to x)
+fn asm_ldr_h(rt Reg, rn Reg) u32 {
+	return 0x79400000 | (u32(rn) << 5) | u32(rt)
+}
+
+// ldrb wt, [rn] (load 8-bit, zero-extend to x)
+fn asm_ldr_b(rt Reg, rn Reg) u32 {
+	return 0x39400000 | (u32(rn) << 5) | u32(rt)
+}
+
+// ldr rt, [rn, #imm12] (load 64-bit with unsigned scaled offset)
+// imm12 is the offset divided by 8 (scaled by element size)
+fn asm_ldr_imm(rt Reg, rn Reg, imm12 u32) u32 {
+	return 0xF9400000 | ((imm12 & 0xFFF) << 10) | (u32(rn) << 5) | u32(rt)
+}
+
+// ldur xt, [xn, #simm9] (unscaled 64-bit load)
 fn asm_ldur(rt Reg, rn Reg, simm9 i32) u32 {
 	return 0xF8400000 | (u32(simm9 & 0x1FF) << 12) | (u32(rn) << 5) | u32(rt)
+}
+
+// ldur wt, [xn, #simm9] (unscaled 32-bit load, zero-extend)
+fn asm_ldur_w(rt Reg, rn Reg, simm9 i32) u32 {
+	return 0xB8400000 | (u32(simm9 & 0x1FF) << 12) | (u32(rn) << 5) | u32(rt)
+}
+
+// ldurh wt, [xn, #simm9] (unscaled 16-bit load, zero-extend)
+fn asm_ldur_h(rt Reg, rn Reg, simm9 i32) u32 {
+	return 0x78400000 | (u32(simm9 & 0x1FF) << 12) | (u32(rn) << 5) | u32(rt)
+}
+
+// ldurb wt, [xn, #simm9] (unscaled 8-bit load, zero-extend)
+fn asm_ldur_b(rt Reg, rn Reg, simm9 i32) u32 {
+	return 0x38400000 | (u32(simm9 & 0x1FF) << 12) | (u32(rn) << 5) | u32(rt)
 }
 
 // === Branches ===
@@ -283,6 +362,11 @@ fn asm_adrp(rd Reg) u32 {
 // add rd, rd, #imm12 (add page offset - typically follows adrp)
 fn asm_add_pageoff(rd Reg) u32 {
 	return 0x91000000 | u32(rd) | (u32(rd) << 5)
+}
+
+// ldr rd, [rd, #imm12] (load from page offset - for GOT access, typically follows adrp)
+fn asm_ldr_pageoff(rd Reg) u32 {
+	return 0xF9400000 | u32(rd) | (u32(rd) << 5)
 }
 
 // === Stack Operations ===

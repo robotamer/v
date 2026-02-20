@@ -80,7 +80,7 @@ fn (mut v Builder) post_process_c_compiler_output(ccompiler string, res os.Resul
 			if ccompiler == 'tcc' && res.output.starts_with('tcc: error: could not run') {
 				println('${highlight_word('Suggestion')}: try using a different C compiler with `-cc gcc` or `-cc clang`.')
 				println('${highlight_word('Suggestion')}: or build TCC for the target architecture yourself.')
-				println('${highlight_word('Note')}: you should build an 32bit version of `${@VROOT}/thirdparty/tcc/lib/libgc.a` first or use `-gc none`.')
+				println('${highlight_word('Note')}: you should build an 32bit version of `${@VEXEROOT}/thirdparty/tcc/lib/libgc.a` first or use `-gc none`.')
 				exit(1)
 			} else {
 				println('Try passing `-g` when compiling, to see a .v file:line information, that correlates more with the C error.')
@@ -281,6 +281,9 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 		if have_flto {
 			optimization_options << '-flto'
 		}
+		// gcc versions newer than 10.2, produce buggy programs, usually triggered by optimising inlined small functions, when both -flto and -O3 are used.
+		// Using -fno-strict-aliasing prevents that. See https://github.com/vlang/v/issues/26512 .
+		optimization_options << '-fno-strict-aliasing'
 	}
 	if ccoptions.cc == .icc {
 		if ccoptions.debug_mode {
@@ -299,7 +302,9 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 		// don't warn for vlib tests
 		if ccoptions.cc == .tcc && !(v.parsed_files.len > 0
 			&& v.parsed_files.last().path.contains('vlib')) {
-			eprintln('Note: tcc is not recommended for -prod builds')
+			if !v.pref.is_quiet {
+				eprintln('Note: tcc is not recommended for -prod builds')
+			}
 		}
 		if !v.pref.no_prod_options {
 			ccoptions.args << optimization_options
@@ -850,7 +855,7 @@ pub fn (mut v Builder) cc() {
 		}
 	}
 	// if v.pref.os == .ios {
-	// ret := os.system('ldid2 -S $v.pref.out_name')
+	// ret := os.system('ldid2 -S ${v.pref.out_name}')
 	// if ret != 0 {
 	// eprintln('failed to run ldid2, try: brew install ldid')
 	// }
@@ -1152,7 +1157,7 @@ fn (mut c Builder) cc_windows_cross() {
 	all_args << c.pref.ldflags
 	c.dump_c_options(all_args)
 	mut cmd := cross_compiler_name_path + ' ' + all_args.join(' ')
-	// cmd := 'clang -o $obj_name -w $include -m32 -c -target x86_64-win32 ${pref.default_module_path}/$c.out_name_c'
+	// cmd := 'clang -o ${obj_name} -w ${include} -m32 -c -target x86_64-win32 ${pref.default_module_path}/${c.out_name_c}'
 	if c.pref.is_verbose || c.pref.show_cc {
 		println(cmd)
 	}

@@ -118,7 +118,7 @@ fn (mut g Gen) fn_decl(node ast.FnDecl) {
 		if ((mod != g.module_built && node.mod != g.module_built.after('/'))
 			|| should_bundle_module) && node.generic_names.len == 0 {
 			// Skip functions that don't have to be generated for this module.
-			// println('skip bm $node.name mod=$node.mod module_built=$g.module_built')
+			// println('skip bm ${node.name} mod=${node.mod} module_built=${g.module_built}')
 			skip = true
 		}
 		if g.is_builtin_mod && g.module_built == 'builtin' && node.mod == 'builtin' {
@@ -754,9 +754,15 @@ fn (mut g Gen) gen_anon_fn_decl(mut node ast.AnonFn) {
 	}
 	pos := g.out.len
 	was_anon_fn := g.anon_fn
+	prev_stmt_path_pos := g.stmt_path_pos.clone()
+	prev_skip_stmt_pos := g.skip_stmt_pos
+	g.stmt_path_pos = []
+	g.skip_stmt_pos = false
 	g.anon_fn = node
 	g.fn_decl(node.decl)
 	g.anon_fn = was_anon_fn
+	g.skip_stmt_pos = prev_skip_stmt_pos
+	g.stmt_path_pos = prev_stmt_path_pos
 	builder.write_string(g.out.cut_to(pos))
 	out := builder.str()
 	g.anon_fn_definitions << out
@@ -981,7 +987,7 @@ fn (mut g Gen) call_expr(node ast.CallExpr) {
 	} else {
 		''
 	}
-	// g.write('/*EE line="$cur_line"*/')
+	// g.write('/*EE line="${cur_line}"*/')
 	tmp_opt := if gen_or || gen_keep_alive {
 		if g.inside_curry_call && g.last_tmp_call_var.len > 0 {
 			g.last_tmp_call_var.pop()
@@ -995,7 +1001,7 @@ fn (mut g Gen) call_expr(node ast.CallExpr) {
 	} else {
 		''
 	}
-	if gen_or || gen_keep_alive {
+	if (gen_or || gen_keep_alive) && node.return_type != 0 {
 		mut ret_typ := node.return_type
 		if g.table.sym(ret_typ).kind == .alias {
 			unaliased_type := g.table.unaliased_type(ret_typ)
@@ -1058,7 +1064,7 @@ fn (mut g Gen) call_expr(node ast.CallExpr) {
 	} else {
 		g.fn_call(node)
 	}
-	if gen_or {
+	if gen_or && node.return_type != 0 {
 		g.or_block(tmp_opt, node.or_block, node.return_type)
 		mut unwrapped_typ := node.return_type.clear_option_and_result()
 		if g.table.sym(unwrapped_typ).kind == .alias {
@@ -1103,7 +1109,7 @@ fn (mut g Gen) call_expr(node ast.CallExpr) {
 				}
 			}
 		}
-	} else if gen_keep_alive {
+	} else if gen_keep_alive && node.return_type != 0 {
 		if node.return_type == ast.void_type {
 			g.write('\n ${cur_line}')
 		} else {
@@ -2002,8 +2008,9 @@ fn (mut g Gen) fn_call(node ast.CallExpr) {
 		mut tmp2 := ''
 		cur_line := g.go_before_last_stmt()
 		if is_json_encode || is_json_encode_pretty {
-			g.gen_json_for_type(node.args[0].typ)
-			json_type_str = g.styp(node.args[0].typ)
+			unwrapped_typ := g.unwrap_generic(node.args[0].typ)
+			g.gen_json_for_type(unwrapped_typ)
+			json_type_str = g.styp(unwrapped_typ)
 			// `json__encode` => `json__encode_User`
 			encode_name := js_enc_name(json_type_str)
 			g.empty_line = true
@@ -2398,7 +2405,7 @@ fn (mut g Gen) autofree_call_pregen(node ast.CallExpr) {
 		g.is_autofree = old_is_autofree
 		g.is_autofree_tmp = false
 		s += expr_code
-		s += ';// new af2 pre'
+		s += ';'
 		g.strs_to_free0 << s
 		// This tmp arg var will be freed with the rest of the vars at the end of the scope.
 	}
@@ -2422,12 +2429,27 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 	// unwrap generics fn/method arguments to concretes
 	if node.concrete_types.len > 0 && node.concrete_types.all(!it.has_flag(.generic)) {
 		if node.is_method {
-			if func := g.table.find_method(g.table.sym(node.left_type), node.name) {
+			// First try to find method on left_type, then fallback to receiver_type for embedded types
+			mut func := ast.Fn{}
+			mut found := false
+			if f := g.table.find_method(g.table.sym(node.left_type), node.name) {
+				func = f
+				found = true
+			} else if node.receiver_type != 0 && node.receiver_type != node.left_type {
+				// Method not found on left_type, try receiver_type (for embedded types)
+				if f := g.table.find_method(g.table.sym(node.receiver_type), node.name) {
+					func = f
+					found = true
+				}
+			}
+			if found {
 				if func.generic_names.len > 0 {
 					for i in 0 .. expected_types.len {
 						mut muttable := unsafe { &ast.Table(g.table) }
-						if utyp := muttable.convert_generic_type(node.expected_arg_types[i],
-							func.generic_names, node.concrete_types)
+						// Ensure the generic flag is set for conversion
+						arg_type := node.expected_arg_types[i].set_flag(.generic)
+						if utyp := muttable.convert_generic_type(arg_type, func.generic_names,
+							node.concrete_types)
 						{
 							expected_types[i] = utyp
 						}
@@ -2439,8 +2461,10 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 				if func.generic_names.len > 0 {
 					for i in 0 .. expected_types.len {
 						mut muttable := unsafe { &ast.Table(g.table) }
-						if utyp := muttable.convert_generic_type(node.expected_arg_types[i],
-							func.generic_names, node.concrete_types)
+						// Ensure the generic flag is set for conversion
+						arg_type := node.expected_arg_types[i].set_flag(.generic)
+						if utyp := muttable.convert_generic_type(arg_type, func.generic_names,
+							node.concrete_types)
 						{
 							expected_types[i] = utyp
 						}
@@ -2474,11 +2498,27 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 			if found && func.generic_names.len > 0 {
 				for i in 0 .. expected_types.len {
 					mut muttable := unsafe { &ast.Table(g.table) }
-					if utyp := muttable.convert_generic_type(node.expected_arg_types[i],
-						func.generic_names, left_sym.info.concrete_types)
+					// Ensure the generic flag is set for conversion
+					arg_type := node.expected_arg_types[i].set_flag(.generic)
+					if utyp := muttable.convert_generic_type(arg_type, func.generic_names,
+						left_sym.info.concrete_types)
 					{
 						expected_types[i] = utyp
 					}
+				}
+			}
+		}
+	}
+	// Final safeguard: ensure any remaining generic types from the outer function are converted
+	if g.cur_fn != unsafe { nil } && g.cur_fn.generic_names.len > 0 && g.cur_concrete_types.len > 0 {
+		for i in 0 .. expected_types.len {
+			sym := g.table.sym(expected_types[i])
+			if sym.name in g.cur_fn.generic_names {
+				mut muttable := unsafe { &ast.Table(g.table) }
+				if utyp := muttable.convert_generic_type(expected_types[i].set_flag(.generic),
+					g.cur_fn.generic_names, g.cur_concrete_types)
+				{
+					expected_types[i] = utyp
 				}
 			}
 		}
@@ -2586,22 +2626,26 @@ fn (mut g Gen) call_args(node ast.CallExpr) {
 		}
 		use_tmp_var_autofree := g.is_autofree && arg.typ == ast.string_type && arg.is_tmp_autofree
 			&& !g.inside_const && !g.is_builtin_mod
-		// g.write('/* af=$arg.is_tmp_autofree */')
+		// g.write('/* af=${arg.is_tmp_autofree} */')
 		// some c fn definitions dont have args (cfns.v) or are not updated in checker
 		// when these are fixed we wont need this check
 		if i < expected_types.len {
-			if use_tmp_var_autofree {
-				if arg.is_tmp_autofree { // && !g.is_js_call {
-					// We saved expressions in temp variables so that they can be freed later.
-					// `foo(str + str2) => x := str + str2; foo(x); x.free()`
-					// g.write('_arg_expr_${g.called_fn_name}_$i')
-					// Use these variables here.
-					fn_name := node.name.replace('.', '_')
-					// name := '_tt${g.tmp_count_af}_arg_expr_${fn_name}_$i'
-					name := '_arg_expr_${fn_name}_${i + 1}_${node.pos.pos}'
+			mut wrote_tmp_arg := false
+			if use_tmp_var_autofree && arg.is_tmp_autofree { // && !g.is_js_call {
+				// We saved expressions in temp variables so that they can be freed later.
+				// `foo(str + str2) => x := str + str2; foo(x); x.free()`
+				// g.write('_arg_expr_${g.called_fn_name}_${i}')
+				// Use these variables here.
+				fn_name := node.name.replace('.', '_')
+				// name := '_tt${g.tmp_count_af}_arg_expr_${fn_name}_${i}'
+				name := '_arg_expr_${fn_name}_${i + 1}_${node.pos.pos}'
+				scope := g.file.scope.innermost(node.pos.pos)
+				if !g.is_autofree_tmp || scope.known_var(name) {
 					g.write('/*autofree arg*/' + name)
+					wrote_tmp_arg = true
 				}
-			} else {
+			}
+			if !wrote_tmp_arg {
 				g.ref_or_deref_arg(arg, expected_types[i], node.language, is_smartcast)
 			}
 		} else {
@@ -2752,7 +2796,8 @@ fn (mut g Gen) keep_alive_call_postgen(node ast.CallExpr, tmp_cnt_save int) {
 }
 
 @[inline]
-fn (mut g Gen) ref_or_deref_arg(arg ast.CallArg, expected_type ast.Type, lang ast.Language, is_smartcast bool) {
+fn (mut g Gen) ref_or_deref_arg(arg ast.CallArg, expected_type_ ast.Type, lang ast.Language, is_smartcast bool) {
+	expected_type := g.unwrap_generic(expected_type_)
 	mut arg_typ := if arg.ct_expr {
 		g.unwrap_generic(g.type_resolver.get_type(arg.expr))
 	} else {

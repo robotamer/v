@@ -123,7 +123,7 @@ fn (mut p Parser) hash() ast.HashStmt {
 	}
 }
 
-const error_msg = 'only `\$tmpl()`, `\$env()`, `\$embed_file()`, `\$pkgconfig()`, `\$vweb.html()`, `\$compile_error()`, `\$compile_warn()`, `\$d()` and `\$res()` comptime functions are supported right now'
+const error_msg = 'only `\$tmpl()`, `\$env()`, `\$embed_file()`, `\$pkgconfig()`, `\$veb.html()`, `\$vweb.html()`, `\$compile_error()`, `\$compile_warn()`, `\$d()` and `\$res()` comptime functions are supported right now'
 
 fn (mut p Parser) comptime_call() ast.ComptimeCall {
 	err_node := ast.ComptimeCall{
@@ -383,6 +383,9 @@ fn (mut p Parser) comptime_call() ast.ComptimeCall {
 			pos:       start_pos
 		},
 	]
+	// Transfer template paths and line mapping from parser to file for error reporting
+	file.template_paths = p.template_paths
+	file.template_line_map = p.template_line_map
 	return ast.ComptimeCall{
 		scope:       unsafe { nil }
 		is_vweb:     true

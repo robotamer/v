@@ -119,7 +119,26 @@ fn (mut g Gen) final_gen_str(typ StrType) {
 	}
 	if typ.typ.has_flag(.option) {
 		opt_typ := if typ.typ.has_flag(.option_mut_param_t) { styp.replace('*', '') } else { styp }
-		g.gen_str_for_option(typ.typ, opt_typ, str_fn_name)
+		// Check if this is a type alias to an option type
+		mut type_name := 'Option'
+		mut unwrapped_typ := g.table.unaliased_type(typ.typ)
+		if unwrapped_typ != typ.typ {
+			// This is a type alias, check if it's an alias to an option type
+			alias_sym := g.table.sym(typ.typ)
+			if alias_sym.kind == .alias && alias_sym.info is ast.Alias {
+				// Check if the parent type has the option flag
+				if alias_sym.info.parent_type.has_flag(.option) {
+					// This is an alias to an option type (e.g., type MyOpt = ?MyStruct)
+					// Use the alias name instead of "Option"
+					mut alias_name := alias_sym.name
+					if alias_name.contains('.') {
+						alias_name = alias_name.all_after_last('.')
+					}
+					type_name = '?${alias_name}'
+				}
+			}
+		}
+		g.gen_str_for_option(typ.typ, opt_typ, str_fn_name, type_name)
 		return
 	}
 	if typ.typ.has_flag(.result) {
@@ -177,7 +196,7 @@ fn (mut g Gen) final_gen_str(typ StrType) {
 	}
 }
 
-fn (mut g Gen) gen_str_for_option(typ ast.Type, styp string, str_fn_name string) {
+fn (mut g Gen) gen_str_for_option(typ ast.Type, styp string, str_fn_name string, type_name string) {
 	$if trace_autostr ? {
 		eprintln('> gen_str_for_option: ${typ.debug()} | ${styp} | ${str_fn_name}')
 	}
@@ -224,9 +243,9 @@ fn (mut g Gen) gen_str_for_option(typ ast.Type, styp string, str_fn_name string)
 			g.auto_str_funcs.writeln('\t\tres = ${parent_str_fn_name}(${deref}it.data);')
 		}
 	}
-	g.auto_str_funcs.writeln('\t\treturn ${str_intp_sub('Option(%%)', 'res')};')
+	g.auto_str_funcs.writeln('\t\treturn ${str_intp_sub('${type_name}(%%)', 'res')};')
 	g.auto_str_funcs.writeln('\t}')
-	g.auto_str_funcs.writeln('\treturn _S("Option(none)");')
+	g.auto_str_funcs.writeln('\treturn _S("${type_name}(none)");')
 	g.auto_str_funcs.writeln('}')
 }
 
@@ -400,6 +419,7 @@ fn (mut g Gen) gen_str_for_interface(info ast.Interface, styp string, typ_str st
 	mut fn_builder := strings.new_builder(512)
 	clean_interface_v_type_name := util.strip_main_name(typ_str)
 	fn_builder.writeln('${g.static_non_parallel}string indent_${str_fn_name}(${styp} x, ${ast.int_type_name} indent_count) { /* gen_str_for_interface */')
+	fn_builder.writeln('\tif (x._typ == 0 && x._object == NULL) return _S("nil");')
 	for typ in info.types {
 		sub_sym := g.table.sym(ast.mktyp(typ))
 		if g.pref.skip_unused && sub_sym.idx !in g.table.used_features.used_syms {
@@ -1143,7 +1163,7 @@ fn (mut g Gen) gen_str_for_struct(info ast.Struct, lang ast.Language, styp strin
 				if field.typ.is_ptr() && sym.kind in [.struct, .interface] {
 					funcprefix += '(indent_count > 25)? _S("<probably circular>") : '
 				}
-				// eprintln('>>> caller_should_free: ${caller_should_free:6s} | funcprefix: $funcprefix | func: $func')
+				// eprintln('>>> caller_should_free: ${caller_should_free:6s} | funcprefix: ${funcprefix} | func: ${func}')
 				if caller_should_free {
 					tmpvar := g.new_tmp_var()
 					fn_body_surrounder.add('\tstring ${tmpvar} = ${funcprefix}${func};',

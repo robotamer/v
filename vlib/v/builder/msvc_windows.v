@@ -162,7 +162,7 @@ fn find_vs_by_reg(vswhere_dir string, host_arch string, target_arch string) !VsI
 		// If its not there then end user needs to update their visual studio
 		// installation!
 		res := os.execute('"${vswhere_dir}\\Microsoft Visual Studio\\Installer\\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath')
-		// println('res: "$res"')
+		// println('res: "${res}"')
 		if res.exit_code != 0 {
 			return error_with_code(res.output, res.exit_code)
 		}
@@ -171,13 +171,13 @@ fn find_vs_by_reg(vswhere_dir string, host_arch string, target_arch string) !VsI
 			// println('Unable to find msvc version')
 			return error('Unable to find vs installation')
 		}
-		// println('version: $version')
+		// println('version: ${version}')
 		v := version.trim_space()
 		lib_path := '${res_output}\\VC\\Tools\\MSVC\\${v}\\lib\\${target_arch}'
 		include_path := '${res_output}\\VC\\Tools\\MSVC\\${v}\\include'
 		if os.exists('${lib_path}\\vcruntime.lib') {
 			p := '${res_output}\\VC\\Tools\\MSVC\\${v}\\bin\\Host${host_arch}\\${target_arch}'
-			// println('$lib_path $include_path')
+			// println('${lib_path} ${include_path}')
 			return VsInstallation{
 				exe_path:     p
 				lib_path:     lib_path
@@ -318,7 +318,7 @@ pub fn (mut v Builder) cc_msvc() {
 		eprintln('Sanitize not supported on msvc.')
 	}
 	// The C file we are compiling
-	// a << '"$TmpPath/$v.out_name_c"'
+	// a << '"$TmpPath/${v.out_name_c}"'
 	a << '"' + os.real_path(v.out_name_c) + '"'
 	if !v.ccoptions.debug_mode {
 		v.pref.cleanup_files << os.real_path(v.out_name_c)
@@ -426,7 +426,7 @@ fn (mut v Builder) build_thirdparty_obj_file_with_msvc(_mod string, path string,
 	}
 	obj_path = os.real_path(obj_path)
 	if os.exists(obj_path) {
-		// println('$obj_path already built.')
+		// println('${obj_path} already built.')
 		return
 	}
 	if trace_thirdparty_obj_files {
@@ -523,6 +523,99 @@ mut:
 	other_flags []string
 }
 
+fn strip_quotes(value string) string {
+	if value.len >= 2 && value[0] == `"` && value[value.len - 1] == `"` {
+		return value[1..value.len - 1]
+	}
+	return value
+}
+
+fn apply_gnu_flag_to_msvc(value string, mut inc_paths []string, mut lib_paths []string, mut real_libs []string) bool {
+	v := strip_quotes(value)
+	if v.starts_with('-I') && v.len > 2 {
+		path := v[2..]
+		inc_paths << '/I"${os.real_path(path)}"'
+		return true
+	}
+	if v.starts_with('-L') && v.len > 2 {
+		path := v[2..]
+		lib_paths << path
+		lib_paths << path + os.path_separator + 'msvc'
+		return true
+	}
+	if v.starts_with('-l') && v.len > 2 {
+		mut lib := v[2..]
+		if lib.starts_with(':') && lib.len > 1 {
+			lib = lib[1..]
+		}
+		if !lib.ends_with('.lib') {
+			lib += '.lib'
+		}
+		real_libs << lib
+		return true
+	}
+	if v.starts_with('-Wl,') {
+		mut consumed := false
+		for part in v[4..].split(',') {
+			if apply_gnu_flag_to_msvc(part, mut inc_paths, mut lib_paths, mut real_libs) {
+				consumed = true
+			}
+		}
+		return consumed
+	}
+	return false
+}
+
+fn split_and_apply_gnu_flags(value string, mut inc_paths []string, mut lib_paths []string, mut real_libs []string) (bool, string) {
+	if !value.contains(' ') {
+		if apply_gnu_flag_to_msvc(value, mut inc_paths, mut lib_paths, mut real_libs) {
+			return true, ''
+		}
+		return false, value
+	}
+	parts := split_quoted_flags(value)
+	mut consumed := false
+	mut leftovers := []string{}
+	for part in parts {
+		if part == '' {
+			continue
+		}
+		if apply_gnu_flag_to_msvc(part, mut inc_paths, mut lib_paths, mut real_libs) {
+			consumed = true
+		} else {
+			leftovers << strip_quotes(part)
+		}
+	}
+	if consumed {
+		return true, leftovers.join(' ')
+	}
+	return false, value
+}
+
+fn split_quoted_flags(value string) []string {
+	mut parts := []string{}
+	mut buf := []u8{}
+	mut in_quote := false
+	for ch in value {
+		if ch == `"` {
+			in_quote = !in_quote
+			continue
+		}
+		if !in_quote && ch == ` ` {
+			if buf.len > 0 {
+				parts << buf.bytestr()
+				buf = []u8{}
+			}
+			continue
+		}
+		buf << ch
+	}
+	if buf.len > 0 {
+		parts << buf.bytestr()
+	}
+	return parts
+}
+
 pub fn (mut v Builder) msvc_string_flags(cflags []cflag.CFlag) MsvcStringFlags {
 	mut real_libs := []string{}
 	mut inc_paths := []string{}
@@ -530,7 +623,17 @@ pub fn (mut v Builder) msvc_string_flags(cflags []cflag.CFlag) MsvcStringFlags {
 	mut defines := []string{}
 	mut other_flags := []string{}
 	for flag in cflags {
-		// println('fl: $flag.name | flag arg: $flag.value')
+		if flag.name == '' {
+			consumed, leftover := split_and_apply_gnu_flags(flag.value, mut inc_paths, mut
+				lib_paths, mut real_libs)
+			if consumed {
+				if leftover != '' {
+					other_flags << strip_quotes(leftover)
+				}
+				continue
+			}
+		}
+		// println('fl: ${flag.name} | flag arg: ${flag.value}')
 		// We need to see if the flag contains -l
 		// -l isnt recognised and these libs will be passed straight to the linker
 		// by the compiler
@@ -540,14 +643,29 @@ pub fn (mut v Builder) msvc_string_flags(cflags []cflag.CFlag) MsvcStringFlags {
 			}
 			// MSVC has no method of linking against a .dll
 			// TODO: we should look for .defs aswell
-			lib_lib := flag.value + '.lib'
-			real_libs << lib_lib
+			parts := split_quoted_flags(flag.value)
+			if parts.len > 0 {
+				mut lib := strip_quotes(parts[0])
+				if lib.starts_with(':') && lib.len > 1 {
+					lib = lib[1..]
+				}
+				if !lib.ends_with('.lib') {
+					lib += '.lib'
+				}
+				real_libs << lib
+				if parts.len > 1 {
+					_, leftover := split_and_apply_gnu_flags(parts[1..].join(' '), mut
+						inc_paths, mut lib_paths, mut real_libs)
+					if leftover != '' {
+						other_flags << strip_quotes(leftover)
+					}
+				}
+			}
 		} else if flag.name == '-I' {
-			inc_paths << flag.format() or { continue }
+			inc_paths << '/I"${os.real_path(flag.value)}"'
 		} else if flag.name == '-D' {
 			defines << '/D${flag.value}'
 		} else if flag.name == '-L' {
-			// TODO: use flag.format() here as well; `#flag -L$when_first_existing(...)` is a more explicit way to achieve the same
 			lib_paths << flag.value
 			lib_paths << flag.value + os.path_separator + 'msvc'
 			// The above allows putting msvc specific .lib files in a subfolder msvc/ ,
@@ -567,7 +685,15 @@ pub fn (mut v Builder) msvc_string_flags(cflags []cflag.CFlag) MsvcStringFlags {
 		} else if flag.value.starts_with('-D') {
 			defines << '/D${flag.value[2..]}'
 		} else {
-			other_flags << flag.value
+			consumed, leftover := split_and_apply_gnu_flags(flag.value, mut inc_paths, mut
+				lib_paths, mut real_libs)
+			if consumed {
+				if leftover != '' {
+					other_flags << strip_quotes(leftover)
+				}
+				continue
+			}
+			other_flags << strip_quotes(flag.value)
 		}
 	}
 	mut lpaths := []string{}

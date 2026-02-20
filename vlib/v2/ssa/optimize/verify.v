@@ -71,7 +71,7 @@ pub fn verify_and_panic(m &ssa.Module, pass_name string) {
 			}
 		}
 		for err in critical_errors {
-			msg += '  ${err}\n'
+			msg += '  ${err.msg}\n'
 		}
 		if warning_count > 0 {
 			msg += '  (${warning_count} non-critical warnings suppressed)\n'
@@ -876,7 +876,8 @@ fn verify_dominance(m &ssa.Module, func ssa.Function) []VerifyError {
 
 				// Skip block references and constants
 				op_val := m.values[op_id]
-				if op_val.kind in [.basic_block, .constant, .global, .string_literal] {
+				if op_val.kind in [.basic_block, .constant, .global, .string_literal,
+					.c_string_literal] {
 					continue
 				}
 

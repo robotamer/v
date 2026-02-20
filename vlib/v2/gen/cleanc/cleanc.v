@@ -5,1742 +5,931 @@
 module cleanc
 
 import v2.ast
+import v2.pref
+import v2.types
 import strings
+import time
 
 pub struct Gen {
 	files []ast.File
+	env   &types.Environment = unsafe { nil }
+	pref  &pref.Preferences  = unsafe { nil }
 mut:
-	sb              strings.Builder
-	indent          int
-	tmp_counter     int // Counter for unique temp variable names
-	fn_types        map[string]string
-	fn_ret_counts   map[string]int // Track number of return values for multi-return functions
-	var_types       map[string]string
-	mut_receivers   map[string]bool     // Track which methods have mutable receivers
-	defer_stmts     [][]ast.Stmt        // Deferred statements for current function
-	enum_names      map[string]bool     // Track enum type names
-	interface_names map[string]bool     // Track interface type names
-	interface_meths map[string][]string // Interface name -> method names
-	type_methods    map[string][]string // Type name -> method names (for vtable generation)
-	cur_match_type  string              // Current match expression type for enum shorthand
+	sb                  strings.Builder
+	indent              int
+	cur_fn_scope        &types.Scope = unsafe { nil }
+	cur_fn_name         string
+	cur_fn_ret_type     string
+	cur_module          string
+	emitted_types       map[string]bool
+	fn_param_is_ptr     map[string][]bool
+	fn_param_types      map[string][]string
+	fn_return_types     map[string]string
+	runtime_local_types map[string]string
+
+	fixed_array_fields          map[string]bool
+	fixed_array_field_elem      map[string]string
+	fixed_array_globals         map[string]bool
+	tuple_aliases               map[string][]string
+	struct_field_types          map[string]string
+	enum_value_to_enum          map[string]string
+	enum_type_fields            map[string]map[string]bool
+	array_aliases               map[string]bool
+	map_aliases                 map[string]bool
+	result_aliases              map[string]bool
+	option_aliases              map[string]bool
+	emitted_result_structs      map[string]bool
+	emitted_option_structs      map[string]bool
+	embedded_field_owner        map[string]string
+	collected_fixed_array_types map[string]FixedArrayInfo
+	collected_map_types         map[string]MapTypeInfo
+	sum_type_variants           map[string][]string
+	// Interface method signatures: interface_name -> [(method_name, cast_signature), ...]
+	interface_methods           map[string][]InterfaceMethodInfo
+	interface_wrapper_specs     map[string]InterfaceWrapperSpec
+	needed_interface_wrappers   map[string]bool
+	ierror_wrapper_bases        map[string]bool
+	needed_ierror_wrapper_bases map[string]bool
+	tmp_counter                 int
+	cur_fn_mut_params           map[string]bool   // names of mut params in current function
+	global_var_modules          map[string]string // global var name → module name
+	primitive_type_aliases      map[string]bool   // type names that are aliases for primitive types
+	emit_modules                map[string]bool   // when set, emit consts/globals/fns only for these modules
+	export_const_symbols        bool
+	cache_bundle_name           string
+	cached_init_calls           []string
+	exported_const_seen         map[string]bool
+	exported_const_symbols      []ExportedConstSymbol
+	cur_file_name               string
+	is_module_ident_cache       map[string]bool    // per-function cache for is_module_ident results
+	not_local_var_cache         map[string]bool    // per-function negative cache for get_local_var_c_type
+	resolved_module_names       map[string]string  // per-function cache for resolve_module_name
+	cached_env_scopes           map[string]voidptr // cache of env_scope results (avoids repeated locking)
+
+	const_exprs     map[string]string // const name → C expression string (for inlining)
+	used_fn_keys    map[string]bool
+	called_fn_names map[string]bool
+	anon_fn_defs    []string // lifted anonymous function definitions
+	pass5_start_pos int      // position in sb where pass 5 starts
+}
+
+struct ExportedConstSymbol {
+	name  string
+	typ   string
+	value string
+}
+
+struct StructDeclInfo {
+	decl ast.StructDecl
+	mod  string
+}
+
+struct FixedArrayInfo {
+	elem_type string
+	size      int
+}
+
+struct MapTypeInfo {
+	key_c_type   string
+	value_c_type string
+}
+
+const primitive_types = ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'f32', 'f64',
+	'bool', 'rune', 'byte', 'voidptr', 'charptr', 'usize', 'isize', 'void', 'char', 'byteptr',
+	'float_literal', 'int_literal']
+
+fn is_empty_stmt(s ast.Stmt) bool {
+	return s is ast.EmptyStmt
 }
 
 pub fn Gen.new(files []ast.File) &Gen {
-	mut g := &Gen{
-		files:           files
-		sb:              strings.new_builder(4096)
-		fn_types:        map[string]string{}
-		fn_ret_counts:   map[string]int{}
-		var_types:       map[string]string{}
-		mut_receivers:   map[string]bool{}
-		enum_names:      map[string]bool{}
-		interface_names: map[string]bool{}
-		interface_meths: map[string][]string{}
-		type_methods:    map[string][]string{}
-	}
-	// Pass 0: Register function return types, mutable receivers, enum names, and interfaces
-	for file in files {
-		for stmt in file.stmts {
-			if stmt is ast.EnumDecl {
-				g.enum_names[stmt.name] = true
-			}
-			if stmt is ast.InterfaceDecl {
-				g.interface_names[stmt.name] = true
-				// Collect method names for this interface
-				mut methods := []string{}
-				for field in stmt.fields {
-					methods << field.name
-				}
-				g.interface_meths[stmt.name] = methods
-			}
-			if stmt is ast.FnDecl {
-				mut ret := 'void'
-				mut ret_count := 1
-				ret_expr := stmt.typ.return_type
-				if ret_expr !is ast.EmptyExpr {
-					// Check for multi-return (TupleType)
-					if ret_expr is ast.Type {
-						if ret_expr is ast.TupleType {
-							ret_count = ret_expr.types.len
-							ret = 'Tuple_${ret_count}_int'
-						} else {
-							ret = g.expr_type_to_c(ret_expr)
-						}
-					} else {
-						ret = g.expr_type_to_c(ret_expr)
-					}
-				}
-
-				if stmt.is_method {
-					// For methods, use mangled name
-					receiver_type := g.expr_type_to_c(stmt.receiver.typ)
-					mangled := '${receiver_type}__${stmt.name}'
-					g.fn_types[mangled] = ret
-					g.fn_ret_counts[mangled] = ret_count
-					// Track if receiver is mutable
-					g.mut_receivers[mangled] = stmt.receiver.is_mut
-					// Track methods per type for vtable generation
-					if receiver_type !in g.type_methods {
-						g.type_methods[receiver_type] = []string{}
-					}
-					g.type_methods[receiver_type] << stmt.name
-				} else {
-					g.fn_types[stmt.name] = ret
-					g.fn_ret_counts[stmt.name] = ret_count
-				}
-			}
-		}
-	}
-	return g
+	return Gen.new_with_env_and_pref(files, unsafe { nil }, unsafe { nil })
 }
 
+pub fn Gen.new_with_env(files []ast.File, env &types.Environment) &Gen {
+	return Gen.new_with_env_and_pref(files, env, unsafe { nil })
+}
+
+pub fn Gen.new_with_env_and_pref(files []ast.File, env &types.Environment, p &pref.Preferences) &Gen {
+	return &Gen{
+		files:               files
+		env:                 unsafe { env }
+		pref:                unsafe { p }
+		sb:                  strings.new_builder(10_000)
+		fn_param_is_ptr:     map[string][]bool{}
+		fn_param_types:      map[string][]string{}
+		fn_return_types:     map[string]string{}
+		runtime_local_types: map[string]string{}
+
+		fixed_array_fields:          map[string]bool{}
+		fixed_array_field_elem:      map[string]string{}
+		fixed_array_globals:         map[string]bool{}
+		tuple_aliases:               map[string][]string{}
+		struct_field_types:          map[string]string{}
+		enum_value_to_enum:          map[string]string{}
+		enum_type_fields:            map[string]map[string]bool{}
+		array_aliases:               map[string]bool{}
+		map_aliases:                 map[string]bool{}
+		result_aliases:              map[string]bool{}
+		option_aliases:              map[string]bool{}
+		emitted_result_structs:      map[string]bool{}
+		emitted_option_structs:      map[string]bool{}
+		embedded_field_owner:        map[string]string{}
+		emit_modules:                map[string]bool{}
+		exported_const_seen:         map[string]bool{}
+		exported_const_symbols:      []ExportedConstSymbol{}
+		interface_wrapper_specs:     map[string]InterfaceWrapperSpec{}
+		needed_interface_wrappers:   map[string]bool{}
+		ierror_wrapper_bases:        map[string]bool{}
+		needed_ierror_wrapper_bases: map[string]bool{}
+		used_fn_keys:                map[string]bool{}
+		called_fn_names:             map[string]bool{}
+	}
+}
+
+fn (mut g Gen) gen_file(file ast.File) {
+	g.set_file_module(file)
+	for stmt in file.stmts {
+		// Skip struct/enum/type/interface/const decls - already emitted in earlier passes
+		if stmt is ast.StructDecl || stmt is ast.EnumDecl || stmt is ast.TypeDecl
+			|| stmt is ast.ConstDecl || stmt is ast.InterfaceDecl {
+			continue
+		}
+		g.gen_stmt(stmt)
+	}
+}
+
+// set_emit_modules limits code emission to the provided module names.
+// Type declarations and forward declarations are still emitted for all modules.
+pub fn (mut g Gen) set_emit_modules(modules []string) {
+	g.emit_modules = map[string]bool{}
+	for module_name in modules {
+		if module_name != '' {
+			g.emit_modules[module_name] = true
+		}
+	}
+}
+
+// set_cached_init_calls sets cache-init functions to invoke from generated main().
+
+// set_used_fn_keys limits function emission to declaration keys marked as used.
+
+fn is_builtin_map_file(path string) bool {
+	normalized := path.replace('\\', '/')
+	return normalized.ends_with('vlib/builtin/map.v')
+}
+
+fn should_keep_builtin_map_decl(decl ast.FnDecl) bool {
+	base_keep := decl.name in ['new_map', 'move', 'clear', 'key_to_index', 'meta_less',
+		'meta_greater', 'ensure_extra_metas', 'set', 'expand', 'rehash', 'reserve', 'cached_rehash',
+		'get_and_set', 'get', 'get_check', 'exists', 'delete', 'keys', 'values', 'clone', 'free',
+		'key', 'value', 'has_index', 'zeros_to_end', 'str']
+	return base_keep || decl.name.starts_with('map_eq_') || decl.name.starts_with('map_clone_')
+		|| decl.name.starts_with('map_free_')
+}
+
+fn should_always_emit_for_markused(path string) bool {
+	if path.ends_with('.vh') {
+		return true
+	}
+	return is_builtin_runtime_keep_file(path)
+}
+
+fn is_builtin_runtime_keep_file(path string) bool {
+	normalized := path.replace('\\', '/')
+	return normalized.ends_with('vlib/builtin/map.c.v')
+		|| normalized.ends_with('vlib/builtin/chan_option_result.v')
+}
+
+fn (g &Gen) should_emit_module(module_name string) bool {
+	if g.emit_modules.len == 0 {
+		return true
+	}
+	return module_name in g.emit_modules
+}
+
+fn (g &Gen) cgen_stats_enabled() bool {
+	return g.pref != unsafe { nil } && g.pref.stats
+}
+
+fn (g &Gen) cgen_stats_scope_label() string {
+	if g.cache_bundle_name.len > 0 {
+		return 'cache:${g.cache_bundle_name}'
+	}
+	if g.emit_modules.len == 0 {
+		return 'full'
+	}
+	if g.emit_modules.len == 1 && 'main' in g.emit_modules {
+		return 'main'
+	}
+	return 'modules:${g.emit_modules.len}'
+}
+
+fn (g &Gen) print_cgen_step_time(stats_enabled bool, scope string, step string, elapsed time.Duration) {
+	if !stats_enabled {
+		return
+	}
+	println('   - C Gen/${scope} ${step}: ${elapsed.milliseconds()}ms')
+}
+
+fn (g &Gen) mark_cgen_step(stats_enabled bool, scope string, mut sw time.StopWatch, stage_start time.Duration, step string) time.Duration {
+	if !stats_enabled {
+		return stage_start
+	}
+	now := sw.elapsed()
+	g.print_cgen_step_time(true, scope, step, time.Duration(now - stage_start))
+	return now
+}
+
+// gen generates C source from the transformed AST files.
 pub fn (mut g Gen) gen() string {
-	g.sb.writeln('// Generated by V Clean C Backend')
-	g.sb.writeln('#include <stdio.h>')
-	g.sb.writeln('#include <stdlib.h>')
-	g.sb.writeln('#include <stdbool.h>')
-	g.sb.writeln('#include <stdint.h>')
-	g.sb.writeln('#include <stddef.h>')
-	g.sb.writeln('#include <string.h>')
-	g.sb.writeln('')
+	stats_enabled := g.cgen_stats_enabled()
+	stats_scope := g.cgen_stats_scope_label()
+	mut stats_sw := time.new_stopwatch()
+	mut stage_start := stats_sw.elapsed()
 
-	// V primitive type aliases
-	g.sb.writeln('// V primitive types')
-	g.sb.writeln('typedef int8_t i8;')
-	g.sb.writeln('typedef int16_t i16;')
-	g.sb.writeln('typedef int32_t i32;')
-	g.sb.writeln('typedef int64_t i64;')
-	g.sb.writeln('typedef uint8_t u8;')
-	g.sb.writeln('typedef uint16_t u16;')
-	g.sb.writeln('typedef uint32_t u32;')
-	g.sb.writeln('typedef uint64_t u64;')
-	g.sb.writeln('typedef float f32;')
-	g.sb.writeln('typedef double f64;')
-	g.sb.writeln('typedef u8 byte;')
-	g.sb.writeln('typedef size_t usize;')
-	g.sb.writeln('typedef ptrdiff_t isize;')
-	g.sb.writeln('typedef u32 rune;')
-	g.sb.writeln('')
+	g.write_preamble()
+	g.collect_module_type_names()
+	g.collect_runtime_aliases()
+	g.collect_fn_signatures()
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'setup')
 
-	g.sb.writeln('typedef struct { char* str; int len; } string;')
-	g.sb.writeln('typedef struct { int start; int end; } Range_;')
-	g.sb.writeln('')
-	// Builtin function declarations
-	g.sb.writeln('static inline void println(string s) { printf("%.*s\\n", s.len, s.str); }')
-	g.sb.writeln('static inline void print(string s) { printf("%.*s", s.len, s.str); }')
-	g.sb.writeln('')
-	// Array type and builtin function
-	g.sb.writeln('typedef struct { void* data; int len; int cap; } Array;')
-	g.sb.writeln('typedef Array Array_int;')
-	g.sb.writeln('')
-	// Tuple types for multi-return functions
-	g.sb.writeln('typedef struct { int f0; int f1; } Tuple_2_int;')
-	g.sb.writeln('typedef struct { int f0; int f1; int f2; } Tuple_3_int;')
-	g.sb.writeln('')
-	// Simple hashmap implementation for map[int]int
-	g.sb.writeln('typedef struct { int* keys; int* values; int len; int cap; } Map_int_int;')
-	g.sb.writeln('static inline Map_int_int __new_map_int_int() {')
-	g.sb.writeln('\tMap_int_int m;')
-	g.sb.writeln('\tm.cap = 16;')
-	g.sb.writeln('\tm.len = 0;')
-	g.sb.writeln('\tm.keys = (int*)calloc(m.cap, sizeof(int));')
-	g.sb.writeln('\tm.values = (int*)calloc(m.cap, sizeof(int));')
-	g.sb.writeln('\treturn m;')
-	g.sb.writeln('}')
-	g.sb.writeln('static inline void __map_int_int_set(Map_int_int* m, int key, int val) {')
-	g.sb.writeln('\tfor (int i = 0; i < m->len; i++) {')
-	g.sb.writeln('\t\tif (m->keys[i] == key) { m->values[i] = val; return; }')
-	g.sb.writeln('\t}')
-	g.sb.writeln('\tif (m->len >= m->cap) {')
-	g.sb.writeln('\t\tm->cap *= 2;')
-	g.sb.writeln('\t\tm->keys = (int*)realloc(m->keys, m->cap * sizeof(int));')
-	g.sb.writeln('\t\tm->values = (int*)realloc(m->values, m->cap * sizeof(int));')
-	g.sb.writeln('\t}')
-	g.sb.writeln('\tm->keys[m->len] = key;')
-	g.sb.writeln('\tm->values[m->len] = val;')
-	g.sb.writeln('\tm->len++;')
-	g.sb.writeln('}')
-	g.sb.writeln('static inline int __map_int_int_get(Map_int_int* m, int key) {')
-	g.sb.writeln('\tfor (int i = 0; i < m->len; i++) {')
-	g.sb.writeln('\t\tif (m->keys[i] == key) return m->values[i];')
-	g.sb.writeln('\t}')
-	g.sb.writeln('\treturn 0;')
-	g.sb.writeln('}')
-	g.sb.writeln('')
-	g.sb.writeln('static inline Array __new_array_from_c_array(int len, int cap, int elem_size, void* data) {')
-	g.sb.writeln('\tArray a;')
-	g.sb.writeln('\ta.len = len;')
-	g.sb.writeln('\ta.cap = cap;')
-	g.sb.writeln('\ta.data = malloc(cap * elem_size);')
-	g.sb.writeln('\tif (data && len > 0) {')
-	g.sb.writeln('\t\tfor (int i = 0; i < len * elem_size; i++) {')
-	g.sb.writeln('\t\t\t((char*)a.data)[i] = ((char*)data)[i];')
-	g.sb.writeln('\t\t}')
-	g.sb.writeln('\t}')
-	g.sb.writeln('\treturn a;')
-	g.sb.writeln('}')
-	g.sb.writeln('')
-
-	// 1. Struct Declarations (Typedefs)
+	// Pre-collect all global variable names so they can be module-qualified
 	for file in g.files {
+		g.set_file_module(file)
+		for stmt in file.stmts {
+			if stmt is ast.GlobalDecl {
+				for field in stmt.fields {
+					if g.cur_module != '' && g.cur_module != 'main' && g.cur_module != 'builtin' {
+						g.global_var_modules[field.name] = g.cur_module
+					}
+				}
+			}
+		}
+	}
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'collect globals')
+
+	// Pass 1: Forward declarations for all structs/unions/sumtypes/interfaces (needed for mutual references)
+	for file in g.files {
+		g.set_file_module(file)
 		for stmt in file.stmts {
 			if stmt is ast.StructDecl {
-				g.sb.writeln('typedef struct ${stmt.name} ${stmt.name};')
-			}
-		}
-	}
-	// Also forward-declare interfaces
-	for file in g.files {
-		for stmt in file.stmts {
-			if stmt is ast.InterfaceDecl {
-				g.sb.writeln('typedef struct ${stmt.name} ${stmt.name};')
-			}
-		}
-	}
-	// Forward-declare sum types
-	for file in g.files {
-		for stmt in file.stmts {
-			if stmt is ast.TypeDecl {
+				if stmt.language == .c {
+					continue
+				}
+				name := g.get_struct_name(stmt)
+				if name in g.emitted_types {
+					continue
+				}
+				g.emitted_types[name] = true
+				keyword := if stmt.is_union { 'union' } else { 'struct' }
+				g.sb.writeln('typedef ${keyword} ${name} ${name};')
+			} else if stmt is ast.TypeDecl {
 				if stmt.variants.len > 0 {
-					g.sb.writeln('typedef struct ${stmt.name} ${stmt.name};')
+					// Sum type needs forward struct declaration
+					name := g.get_type_decl_name(stmt)
+					if name !in g.emitted_types {
+						g.emitted_types[name] = true
+						g.sb.writeln('typedef struct ${name} ${name};')
+					}
+				}
+			} else if stmt is ast.InterfaceDecl {
+				name := g.get_interface_name(stmt)
+				if name !in g.emitted_types {
+					g.emitted_types[name] = true
+					g.sb.writeln('typedef struct ${name} ${name};')
 				}
 			}
 		}
 	}
 	g.sb.writeln('')
+	g.emit_runtime_aliases()
+	g.sb.writeln('')
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'pass 1 forward decls')
 
-	// 2. Struct Definitions
+	// Pass 2: Enum declarations, type aliases, interface structs, and sum type structs
+	// (before struct definitions that may reference them)
 	for file in g.files {
-		for stmt in file.stmts {
-			if stmt is ast.StructDecl {
-				g.gen_struct_decl(stmt)
-				g.sb.writeln('')
-			}
-		}
-	}
-
-	// 2.5. Enum Declarations
-	for file in g.files {
+		g.set_file_module(file)
 		for stmt in file.stmts {
 			if stmt is ast.EnumDecl {
 				g.gen_enum_decl(stmt)
-				g.sb.writeln('')
-			}
-		}
-	}
-
-	// 2.6. Interface Declarations
-	for file in g.files {
-		for stmt in file.stmts {
-			if stmt is ast.InterfaceDecl {
+			} else if stmt is ast.TypeDecl {
+				if stmt.variants.len == 0 && stmt.base_type !is ast.EmptyExpr {
+					g.gen_type_alias(stmt)
+				} else if stmt.variants.len > 0 {
+					g.gen_sum_type_decl(stmt)
+				}
+			} else if stmt is ast.InterfaceDecl {
 				g.gen_interface_decl(stmt)
-				g.sb.writeln('')
 			}
 		}
 	}
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'pass 2 type declarations')
 
-	// 2.7. Type Declarations
+	// Pass 3: Full struct definitions (use named struct/union to match forward decls)
+	// Collect all struct decls, then emit in dependency order
+	mut all_structs := []StructDeclInfo{}
 	for file in g.files {
+		g.set_file_module(file)
 		for stmt in file.stmts {
-			if stmt is ast.TypeDecl {
-				g.gen_type_decl(stmt)
-				g.sb.writeln('')
+			if stmt is ast.StructDecl {
+				if stmt.language == .c {
+					continue
+				}
+				all_structs << StructDeclInfo{
+					decl: stmt
+					mod:  g.cur_module
+				}
 			}
 		}
 	}
-
-	// 3. Globals
-	for file in g.files {
-		for stmt in file.stmts {
-			if stmt is ast.GlobalDecl {
-				g.gen_global_decl(stmt)
-				g.sb.writeln('')
+	// Emit structs with only primitive/resolved fields first, then the rest.
+	// Interleave option/result wrapper emission as soon as their payload types are complete.
+	// Repeat until no more progress (simple topo sort with wrapper side-effects).
+	for _ in 0 .. (all_structs.len * 2) {
+		mut progressed := false
+		for info in all_structs {
+			g.cur_module = info.mod
+			name := g.get_struct_name(info.decl)
+			body_key := 'body_${name}'
+			if body_key in g.emitted_types {
+				continue
+			}
+			// Check if all field types are already defined
+			if g.struct_fields_resolved(info.decl) {
+				g.gen_struct_decl(info.decl)
+				progressed = true
 			}
 		}
+		if g.emit_ready_option_result_structs() {
+			progressed = true
+		}
+		if !progressed {
+			break
+		}
 	}
+	// Emit any remaining structs (circular deps - just emit them)
+	for info in all_structs {
+		g.cur_module = info.mod
+		g.gen_struct_decl(info.decl)
+	}
+	_ = g.emit_ready_option_result_structs()
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'pass 3 struct definitions')
 
-	// 3.5. Constants
+	// Pass 3.1: Emit deferred (non-primitive) fixed array typedefs now that struct defs exist
+	g.emit_deferred_fixed_array_aliases()
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'pass 3.1 fixed arrays')
+
+	// Pass 3.25: Tuple aliases (multiple-return lowering support)
+	g.emit_tuple_aliases()
+	if g.tuple_aliases.len > 0 {
+		g.sb.writeln('')
+	}
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'pass 3.25 tuple aliases')
+
+	// Pass 3.3: Emit option/result struct definitions (needs IError + tuple types defined)
+	g.emit_option_result_structs()
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'pass 3.3 option/result structs')
+
+	// Pass 3.5: Emit constants before function declarations/bodies, so macros are available.
 	for file in g.files {
+		g.set_file_module(file)
+		if !g.should_emit_module(g.cur_module) {
+			continue
+		}
 		for stmt in file.stmts {
 			if stmt is ast.ConstDecl {
 				g.gen_const_decl(stmt)
-				g.sb.writeln('')
 			}
 		}
 	}
+	g.sb.writeln('')
+	// Recursive array equality helper for nested arrays and string arrays
+	g.sb.writeln('bool string__eq(string a, string b);')
+	g.sb.writeln('static inline bool __v2_array_eq(array a, array b) {')
+	g.sb.writeln('	if (a.len != b.len || a.element_size != b.element_size) return false;')
+	g.sb.writeln('	if (a.element_size == sizeof(array)) {')
+	g.sb.writeln('		for (int i = 0; i < a.len; i++) {')
+	g.sb.writeln('			if (!__v2_array_eq(((array*)a.data)[i], ((array*)b.data)[i])) return false;')
+	g.sb.writeln('		}')
+	g.sb.writeln('		return true;')
+	g.sb.writeln('	}')
+	g.sb.writeln('	if (a.element_size == sizeof(string)) {')
+	g.sb.writeln('		for (int i = 0; i < a.len; i++) {')
+	g.sb.writeln('			if (!string__eq(((string*)a.data)[i], ((string*)b.data)[i])) return false;')
+	g.sb.writeln('		}')
+	g.sb.writeln('		return true;')
+	g.sb.writeln('	}')
+	g.sb.writeln('	return memcmp(a.data, b.data, a.len * a.element_size) == 0;')
+	g.sb.writeln('}')
+	g.sb.writeln('')
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'pass 3.5 const declarations')
 
-	// 4. Function Prototypes
+	// Pass 4: Function forward declarations
+	mut test_fn_names := []string{}
+	mut has_main := false
 	for file in g.files {
+		g.set_file_module(file)
 		for stmt in file.stmts {
 			if stmt is ast.FnDecl {
+				if !g.should_emit_fn_decl(g.cur_module, stmt) {
+					continue
+				}
+				if stmt.language == .js {
+					continue
+				}
+				if stmt.language == .c && stmt.stmts.len == 0 {
+					continue
+				}
+				// Skip generic functions - they have unresolved type params
+				if stmt.typ.generic_params.len > 0 {
+					continue
+				}
+				fn_name := g.get_fn_name(stmt)
+				if fn_name == '' {
+					continue
+				}
+				if fn_name == 'main' {
+					has_main = true
+				}
+				if stmt.name.starts_with('test_') && !stmt.is_method && stmt.typ.params.len == 0 {
+					test_fn_names << fn_name
+				}
+				if g.env != unsafe { nil } {
+					if fn_scope := g.env.get_fn_scope(g.cur_module, fn_name) {
+						g.cur_fn_scope = fn_scope
+					}
+				}
 				g.gen_fn_head(stmt)
 				g.sb.writeln(';')
 			}
 		}
 	}
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'pass 4 fn forward declarations')
+
 	g.sb.writeln('')
+	g.emit_cached_init_call_decls()
+	g.emit_ierror_wrapper_decls()
+	g.collect_interface_wrapper_specs()
+	g.emit_interface_method_wrapper_decls()
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'pass 4 helper declarations')
 
-	// 4.5. Interface vtable wrapper functions (after prototypes so methods are declared)
-	// These cast void* to the concrete type and call the real method
-	g.gen_interface_wrappers()
-
-	// 5. Functions
+	// Pass 5: Everything else (function bodies, consts, globals, etc.)
+	g.pass5_start_pos = g.sb.len
 	for file in g.files {
-		for stmt in file.stmts {
-			if stmt is ast.FnDecl {
-				g.gen_fn_decl(stmt)
-				g.sb.writeln('')
-			}
+		g.set_file_module(file)
+		if !g.should_emit_module(g.cur_module) {
+			g.gen_file_extern_globals(file)
+			g.gen_file_extern_consts(file)
+			continue
 		}
+		g.gen_file(file)
 	}
+	g.emit_needed_ierror_wrappers()
+	g.emit_needed_interface_method_wrappers()
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'pass 5 file bodies')
 
-	return g.sb.str()
+	// Generate test runner main if this is a test file (has test_ functions but no main)
+	// Skip when generating cached module sources (cache_bundle_name is set) - main belongs only in the main module source
+	if !has_main && test_fn_names.len > 0 && g.cache_bundle_name.len == 0 {
+		g.sb.writeln('')
+		g.sb.writeln('int main(int ___argc, char** ___argv) {')
+		g.sb.writeln('\tg_main_argc = ___argc;')
+		g.sb.writeln('\tg_main_argv = (void*)___argv;')
+		for init_call in g.cached_init_calls {
+			g.sb.writeln('\t${init_call}();')
+		}
+		for test_fn in test_fn_names {
+			msg_run := 'Running test: ${test_fn}...'
+			msg_ok := '  OK'
+			g.sb.writeln('\tprintln(${c_static_v_string_expr(msg_run)});')
+			g.sb.writeln('\t${test_fn}();')
+			g.sb.writeln('\tprintln(${c_static_v_string_expr(msg_ok)});')
+		}
+		msg_all := 'All ${test_fn_names.len} tests passed.'
+		g.sb.writeln('\tprintln(${c_static_v_string_expr(msg_all)});')
+		g.sb.writeln('\treturn 0;')
+		g.sb.writeln('}')
+	}
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'test main synthesis')
+
+	g.emit_missing_array_contains_fallbacks()
+	g.emit_cached_module_init_function()
+	g.emit_exported_const_symbols()
+	stage_start = g.mark_cgen_step(stats_enabled, stats_scope, mut stats_sw, stage_start,
+		'final helper emission')
+
+	mut out := ''
+	if g.anon_fn_defs.len > 0 {
+		full := g.sb.str()
+		mut out_sb := strings.new_builder(full.len + 4096)
+		unsafe { out_sb.write_ptr(full.str, g.pass5_start_pos) }
+		for def in g.anon_fn_defs {
+			out_sb.write_string(def)
+		}
+		if g.pass5_start_pos < full.len {
+			unsafe { out_sb.write_ptr(full.str + g.pass5_start_pos, full.len - g.pass5_start_pos) }
+		}
+		out = out_sb.str()
+	} else {
+		out = g.sb.str()
+	}
+	if stats_enabled {
+		g.print_cgen_step_time(true, stats_scope, 'string materialization', time.Duration(stats_sw.elapsed() - stage_start))
+		g.print_cgen_step_time(true, stats_scope, 'total', stats_sw.elapsed())
+	}
+	return out
 }
 
-fn (mut g Gen) type_to_c(t ast.Type) string {
-	s := t.str()
-	if s == 'string' {
-		return 'string'
+fn is_c_identifier_like(name string) bool {
+	if name.len == 0 {
+		return false
 	}
-	return s
-}
-
-fn (mut g Gen) expr_type_to_c(e ast.Expr) string {
-	match e {
-		ast.Ident {
-			name := e.name
-			if name == 'int' || name == 'i64' || name == 'i32' || name == 'i16' || name == 'i8' {
-				return 'int'
-			}
-			if name == 'u64' || name == 'u32' || name == 'u16' || name == 'u8' || name == 'byte' {
-				return 'unsigned int'
-			}
-			if name == 'bool' {
-				return 'bool'
-			}
-			if name == 'string' {
-				return 'string'
-			}
-			if name == 'voidptr' {
-				return 'void*'
-			}
-			if name == 'charptr' {
-				return 'char*'
-			}
-			// Assume it's a struct type
-			return name
-		}
-		ast.PrefixExpr {
-			// Handle pointer types like &Point
-			if e.op == .amp {
-				return g.expr_type_to_c(e.expr) + '*'
-			}
-			return 'void*'
-		}
-		ast.ModifierExpr {
-			// Handle mut, shared, etc.
-			return g.expr_type_to_c(e.expr)
-		}
-		ast.EmptyExpr {
-			return 'void'
-		}
-		ast.Type {
-			// Handle Type variants
-			if e is ast.MapType {
-				return 'Map_int_int'
-			}
-			if e is ast.TupleType {
-				// Multi-return tuple type
-				return 'Tuple_${e.types.len}_int'
-			}
-			// Handle Option and Result types
-			if e is ast.OptionType {
-				// For ?T, we use the base type (simplified - no proper optional handling)
-				return g.expr_type_to_c(e.base_type)
-			}
-			if e is ast.ResultType {
-				// For !T, we use the base type (simplified - no proper result handling)
-				return g.expr_type_to_c(e.base_type)
-			}
-			return 'int'
-		}
-		else {
-			return 'int'
-		}
-	}
-}
-
-fn (mut g Gen) infer_type(node ast.Expr) string {
-	match node {
-		ast.BasicLiteral {
-			if node.kind == .number {
-				// Check if it's a float literal (contains decimal point or exponent)
-				if node.value.contains('.') || node.value.contains('e') || node.value.contains('E') {
-					return 'double'
-				}
-				return 'int'
-			}
-			if node.kind in [.key_true, .key_false] {
-				return 'bool'
-			}
-		}
-		ast.StringLiteral {
-			if node.value.starts_with("c'") {
-				return 'char*'
-			}
-			return 'string'
-		}
-		ast.StringInterLiteral {
-			return 'string'
-		}
-		ast.ArrayInitExpr {
-			// For array literals, infer element type from first expr
-			if node.exprs.len > 0 {
-				elem_type := g.infer_type(node.exprs[0])
-				return 'Array_${elem_type}'
-			}
-			return 'Array_int'
-		}
-		ast.InitExpr {
-			// Check if it's a map type
-			if node.typ is ast.Type {
-				if node.typ is ast.MapType {
-					return 'Map_int_int'
-				}
-			}
-			return g.expr_type_to_c(node.typ)
-		}
-		ast.PrefixExpr {
-			if node.op == .amp {
-				// Address-of: &x -> pointer to type of x
-				inner := g.infer_type(node.expr)
-				return inner + '*'
-			}
-			if node.op == .mul {
-				// Dereference: *x -> base type of pointer
-				inner := g.infer_type(node.expr)
-				if inner.ends_with('*') {
-					return inner[..inner.len - 1]
-				}
-			}
-			return g.infer_type(node.expr)
-		}
-		ast.CallExpr {
-			mut name := ''
-			if node.lhs is ast.Ident {
-				name = node.lhs.name
-			} else if node.lhs is ast.SelectorExpr {
-				// Method call - look up method return type
-				name = node.lhs.rhs.name
-				// Get receiver type
-				receiver_type := g.infer_type(node.lhs.lhs)
-				clean_type := if receiver_type.ends_with('*') {
-					receiver_type[..receiver_type.len - 1]
-				} else {
-					receiver_type
-				}
-				mangled := '${clean_type}__${name}'
-				if t := g.fn_types[mangled] {
-					return t
-				}
-			}
-
-			if t := g.fn_types[name] {
-				return t
-			}
-			// C builtins defaults
-			if name in ['printf', 'puts', 'putchar', 'malloc'] {
-				return 'int'
-			}
-			return 'int'
-		}
-		ast.CallOrCastExpr {
-			mut name := ''
-			if node.lhs is ast.Ident {
-				name = node.lhs.name
-				// Check if this is interface boxing - return the interface type
-				if name in g.interface_names {
-					return name
-				}
-			}
-			if t := g.fn_types[name] {
-				return t
-			}
-			return 'int'
-		}
-		ast.Ident {
-			if t := g.var_types[node.name] {
-				return t
-			}
-			return 'int'
-		}
-		ast.ParenExpr {
-			return g.infer_type(node.expr)
-		}
-		ast.InfixExpr {
-			return g.infer_type(node.lhs)
-		}
-		ast.SelectorExpr {
-			// Check if this is an enum value access (EnumName.value)
-			if node.lhs is ast.Ident {
-				if node.lhs.name in g.enum_names {
-					return node.lhs.name
-				}
-			}
-			// For selector expressions, we return the field type
-			// Since struct fields in this test are mostly int, we return int
-			// TODO: Implement proper field type lookup
-			return 'int'
-		}
-		ast.IndexExpr {
-			// Check if this is a slice (range) operation
-			if node.expr is ast.RangeExpr {
-				// Slice returns same type as the base array
-				return g.infer_type(node.lhs)
-			}
-			// For regular array/map indexing, get the element type
-			base_type := g.infer_type(node.lhs)
-			if base_type.starts_with('Map_') {
-				// Map_int_int -> return int (the value type)
-				return 'int'
-			}
-			if base_type.starts_with('Array_') {
-				return base_type['Array_'.len..]
-			}
-			return 'int'
-		}
-		ast.ModifierExpr {
-			return g.infer_type(node.expr)
-		}
-		ast.RangeExpr {
-			return 'Range_'
-		}
-		ast.MapInitExpr {
-			return 'Map_int_int'
-		}
-		else {
-			return 'int'
-		}
-	}
-	return ''
-}
-
-fn (mut g Gen) gen_struct_decl(node ast.StructDecl) {
-	g.sb.writeln('struct ${node.name} {')
-	for field in node.fields {
-		g.write_indent()
-		g.sb.write_string('\t')
-		t := g.expr_type_to_c(field.typ)
-		g.sb.writeln('${t} ${field.name};')
-	}
-	g.sb.writeln('};')
-}
-
-fn (mut g Gen) gen_global_decl(node ast.GlobalDecl) {
-	for field in node.fields {
-		t := g.expr_type_to_c(field.typ)
-		g.sb.writeln('${t} ${field.name};')
-	}
-}
-
-fn (mut g Gen) gen_const_decl(node ast.ConstDecl) {
-	for field in node.fields {
-		t := g.infer_type(field.value)
-		g.sb.write_string('const ${t} ${field.name} = ')
-		g.gen_expr(field.value)
-		g.sb.writeln(';')
-	}
-}
-
-fn (mut g Gen) gen_enum_decl(node ast.EnumDecl) {
-	// Generate C enum declaration
-	g.sb.writeln('typedef enum {')
-	for i, field in node.fields {
-		g.sb.write_string('\t${node.name}__${field.name}')
-		if field.value !is ast.EmptyExpr {
-			g.sb.write_string(' = ')
-			g.gen_expr(field.value)
-		}
-		if i < node.fields.len - 1 {
-			g.sb.writeln(',')
-		} else {
-			g.sb.writeln('')
-		}
-	}
-	g.sb.writeln('} ${node.name};')
-}
-
-fn (mut g Gen) gen_interface_decl(node ast.InterfaceDecl) {
-	// Generate C struct for interface (vtable-style)
-	// Note: typedef forward declaration is already generated above
-	g.sb.writeln('struct ${node.name} {')
-	g.sb.writeln('\tvoid* _object;  // Pointer to concrete object')
-	g.sb.writeln('\tint _type_id;   // Type identifier')
-	// Generate function pointers for each method
-	for field in node.fields {
-		g.write_indent()
-		g.sb.write_string('\t')
-		// Interface fields can be method signatures or regular fields
-		// FnType is wrapped: Expr -> Type -> FnType
-		if field.typ is ast.Type {
-			if field.typ is ast.FnType {
-				// Method signature - generate function pointer
-				fn_type := field.typ as ast.FnType
-				mut ret := 'void'
-				if fn_type.return_type !is ast.EmptyExpr {
-					ret = g.expr_type_to_c(fn_type.return_type)
-				}
-				g.sb.write_string('${ret} (*${field.name})(void*')
-				for param in fn_type.params {
-					g.sb.write_string(', ')
-					t := g.expr_type_to_c(param.typ)
-					g.sb.write_string(t)
-				}
-				g.sb.writeln(');')
-			} else {
-				// Other type expression
-				t := g.expr_type_to_c(field.typ)
-				g.sb.writeln('${t} ${field.name};')
-			}
-		} else {
-			// Regular field
-			t := g.expr_type_to_c(field.typ)
-			g.sb.writeln('${t} ${field.name};')
-		}
-	}
-	g.sb.writeln('};')
-}
-
-// gen_interface_wrappers generates wrapper functions for interface vtables
-// Each wrapper casts void* to the concrete type and calls the actual method
-fn (mut g Gen) gen_interface_wrappers() {
-	// For each interface
-	for iface_name, methods in g.interface_meths {
-		// For each concrete type that has these methods
-		for type_name, type_meths in g.type_methods {
-			// Check if this type implements all interface methods
-			if !g.type_implements_interface(methods, type_meths) {
-				continue
-			}
-
-			// Generate wrapper functions for this type implementing this interface
-			for meth in methods {
-				// Get return type from the registered function
-				mangled := '${type_name}__${meth}'
-				ret_type := g.fn_types[mangled] or { 'int' }
-
-				// Generate: RetType InterfaceName_TypeName_method_wrapper(void* _obj) {
-				//     return TypeName__method(*(TypeName*)_obj);
-				// }
-				g.sb.writeln('static ${ret_type} ${iface_name}_${type_name}_${meth}_wrapper(void* _obj) {')
-				g.sb.writeln('\treturn ${type_name}__${meth}(*(${type_name}*)_obj);')
-				g.sb.writeln('}')
-				g.sb.writeln('')
-			}
-		}
-	}
-}
-
-// type_implements_interface checks if a type has all the interface methods
-fn (g Gen) type_implements_interface(iface_methods []string, type_methods []string) bool {
-	for meth in iface_methods {
-		if meth !in type_methods {
+	for ch in name {
+		if !(ch.is_letter() || ch.is_digit() || ch == `_`) {
 			return false
 		}
 	}
 	return true
 }
 
-fn (mut g Gen) gen_type_decl(node ast.TypeDecl) {
-	if node.variants.len > 0 {
-		// Sum type: generate a tagged union
-		// Note: typedef forward declaration is already generated above
-		g.sb.writeln('struct ${node.name} {')
-		g.sb.writeln('\tint _tag;')
-		g.sb.writeln('\tunion {')
-		for i, variant in node.variants {
-			// Use a safe name for union fields (prefix with underscore to avoid reserved words)
-			variant_name := if variant is ast.Ident {
-				'_${variant.name}'
-			} else {
-				'_v${i}'
-			}
-			g.sb.writeln('\t\tvoid* ${variant_name};')
-		}
-		g.sb.writeln('\t} _data;')
-		g.sb.writeln('};')
-	} else if node.base_type !is ast.EmptyExpr {
-		// Type alias: generate typedef
-		base_type := g.expr_type_to_c(node.base_type)
-		g.sb.writeln('typedef ${base_type} ${node.name};')
+fn is_c_runtime_function(name string) bool {
+	return name in ['free', 'malloc', 'realloc', 'calloc', 'memcmp', 'memcpy', 'memmove', 'memset',
+		'memchr', 'memmem', 'strlen', 'strcmp', 'strncmp', 'snprintf', 'sprintf', 'printf', 'fprintf',
+		'asprintf', 'atoi', 'atoll', 'atof', 'qsort', 'popen', 'realpath', 'chmod', 'exit',
+		'backtrace_symbols', 'backtrace_symbols_fd', 'proc_pidpath', 'wyhash', 'wyhash64']
+}
+
+fn shallow_copy_exprs(exprs []ast.Expr) []ast.Expr {
+	mut out := []ast.Expr{cap: exprs.len}
+	for expr in exprs {
+		out << expr
+	}
+	return out
+}
+
+const c_keywords = ['auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do', 'double',
+	'else', 'enum', 'extern', 'float', 'for', 'goto', 'if', 'inline', 'int', 'long', 'register',
+	'restrict', 'return', 'short', 'signed', 'sizeof', 'static', 'struct', 'switch', 'typedef',
+	'union', 'unsigned', 'void', 'volatile', 'while', '_Bool', '_Complex', '_Imaginary', 'unix',
+	'linux']
+
+const c_stdlib_fns = ['malloc', 'calloc', 'realloc', 'free', 'atoi', 'atof', 'atol', 'memcpy',
+	'memset', 'memmove', 'strlen', 'strcpy', 'strcat', 'strcmp', 'memcmp', 'exit']
+
+fn escape_c_keyword(name string) string {
+	if name in c_keywords {
+		return '_${name}'
+	}
+	return name
+}
+
+fn sanitize_fn_ident(name string) string {
+	return match name {
+		'+' { 'plus' }
+		'-' { 'minus' }
+		'*' { 'mul' }
+		'/' { 'div' }
+		'%' { 'mod' }
+		'==' { 'eq' }
+		'!=' { 'ne' }
+		'<' { 'lt' }
+		'>' { 'gt' }
+		'<=' { 'le' }
+		'>=' { 'ge' }
+		'|' { 'pipe' }
+		'^' { 'xor' }
+		else { name }
 	}
 }
 
-fn (mut g Gen) gen_fn_head(node ast.FnDecl) {
-	mut ret := 'void'
-	ret_expr := node.typ.return_type
-	if ret_expr !is ast.EmptyExpr {
-		ret = g.expr_type_to_c(ret_expr)
+fn (mut g Gen) is_module_ident(name string) bool {
+	if cached := g.is_module_ident_cache[name] {
+		return cached
 	}
-	if node.name == 'main' {
-		ret = 'int'
+	mut result := false
+	if g.cur_fn_scope != unsafe { nil } {
+		if obj := g.cur_fn_scope.lookup_parent(name, 0) {
+			result = obj is types.Module
+			g.is_module_ident_cache[name] = result
+			return result
+		}
 	}
-
-	// For methods, generate a mangled name
-	mut fn_name := node.name
-	mut has_receiver := false
-	mut receiver_type := ''
-	mut receiver_name := ''
-	mut receiver_is_ptr := false
-	if node.is_method {
-		receiver_type = g.expr_type_to_c(node.receiver.typ)
-		receiver_name = node.receiver.name
-		receiver_is_ptr = node.receiver.is_mut
-		// Mangle method name: TypeName__methodName
-		fn_name = '${receiver_type}__${node.name}'
-		has_receiver = true
+	if g.env != unsafe { nil } {
+		if mut scope := g.env_scope(g.cur_module) {
+			if obj := scope.lookup_parent(name, 0) {
+				result = obj is types.Module
+			}
+		}
 	}
+	g.is_module_ident_cache[name] = result
+	return result
+}
 
-	g.sb.write_string('${ret} ${fn_name}(')
+// resolve_module_name resolves a module alias to its real module name.
+// Returns the input name unchanged if it's not a module or can't be resolved.
+fn (mut g Gen) resolve_module_name(name string) string {
+	// Check cache first (module name resolution is constant per-function).
+	if cached := g.resolved_module_names[name] {
+		return cached
+	}
+	mut result := name
+	if g.cur_fn_scope != unsafe { nil } {
+		if obj := g.cur_fn_scope.lookup_parent(name, 0) {
+			if obj is types.Module {
+				mod := unsafe { &types.Module(&obj) }
+				if mod.name != '' {
+					result = mod.name
+				}
+			}
+			g.resolved_module_names[name] = result
+			return result
+		}
+	}
+	if g.env != unsafe { nil } {
+		if mut scope := g.env_scope(g.cur_module) {
+			if obj := scope.lookup_parent(name, 0) {
+				if obj is types.Module {
+					mod := unsafe { &types.Module(&obj) }
+					if mod.name != '' {
+						result = mod.name
+					}
+				}
+			}
+		}
+		g.resolved_module_names[name] = result
+		return result
+	}
+	g.resolved_module_names[name] = result
+	return result
+}
 
-	mut first := true
-	// Add receiver as first parameter for methods
-	if has_receiver {
-		if receiver_is_ptr {
-			g.sb.write_string('${receiver_type}* ${receiver_name}')
+fn sanitize_c_number_literal(lit string) string {
+	mut s := lit
+	if s.contains('_') {
+		s = s.replace('_', '')
+	}
+	// Convert V octal prefix 0o to C octal prefix 0
+	if s.starts_with('0o') || s.starts_with('0O') {
+		s = '0${s[2..]}'
+	}
+	return s
+}
+
+fn strip_literal_quotes(raw string) string {
+	if raw.len < 2 {
+		return raw
+	}
+	first := raw[0]
+	last := raw[raw.len - 1]
+	if first == last && first in [`'`, `"`] {
+		return raw[1..raw.len - 1]
+	}
+	return raw
+}
+
+fn escape_char_literal_content(raw string) string {
+	mut sb := strings.new_builder(raw.len + 4)
+	for ch in raw {
+		if ch == `'` {
+			sb.write_u8(`\\`)
+			sb.write_u8(`'`)
 		} else {
-			g.sb.write_string('${receiver_type} ${receiver_name}')
+			sb.write_u8(ch)
 		}
-		first = false
 	}
+	return sb.str()
+}
 
-	for param in node.typ.params {
-		if !first {
-			g.sb.write_string(', ')
-		}
-		first = false
-		t := g.expr_type_to_c(param.typ)
-		if param.is_mut {
-			g.sb.write_string('${t}* ${param.name}')
+fn escape_c_string_literal_segment(raw string) string {
+	mut sb := strings.new_builder(raw.len + 8)
+	for ch in raw {
+		if ch == `"` {
+			sb.write_u8(`\\`)
+			sb.write_u8(`"`)
+		} else if ch == `\r` {
+			sb.write_u8(`\\`)
+			sb.write_u8(`r`)
 		} else {
-			g.sb.write_string('${t} ${param.name}')
+			sb.write_u8(ch)
 		}
 	}
-	g.sb.write_string(')')
+	return sb.str()
 }
 
-fn (mut g Gen) gen_fn_decl(node ast.FnDecl) {
-	g.var_types = map[string]string{}
-	g.defer_stmts.clear()
-
-	// Register receiver for methods
-	if node.is_method {
-		receiver_type := g.expr_type_to_c(node.receiver.typ)
-		if node.receiver.is_mut {
-			g.var_types[node.receiver.name] = receiver_type + '*'
-		} else {
-			g.var_types[node.receiver.name] = receiver_type
+// c_string_literal_content_to_c converts raw bytes into a valid C string literal.
+// Multiline content is emitted as adjacent literals, separated by real newlines:
+// "line1\n"
+// "line2"
+fn c_string_literal_content_to_c(raw string) string {
+	newline_idx := raw.index('\n') or { -1 }
+	if newline_idx < 0 {
+		escaped := escape_c_string_literal_segment(raw)
+		return '"${escaped}"'
+	}
+	mut sb := strings.new_builder(raw.len + 32)
+	mut start := 0
+	for i := 0; i < raw.len; i++ {
+		if raw[i] != `\n` {
+			continue
 		}
+		escaped := escape_c_string_literal_segment(raw[start..i])
+		sb.write_u8(`"`)
+		sb.write_string(escaped)
+		sb.write_string('\\n"')
+		sb.write_u8(`\n`)
+		start = i + 1
 	}
-
-	// Register params
-	for param in node.typ.params {
-		t := g.expr_type_to_c(param.typ)
-		if param.is_mut {
-			g.var_types[param.name] = t + '*'
-		} else {
-			g.var_types[param.name] = t
-		}
-	}
-
-	g.gen_fn_head(node)
-	g.sb.writeln(' {')
-	g.indent++
-	g.gen_stmts(node.stmts)
-
-	// Emit deferred statements before implicit return (for all functions)
-	g.emit_deferred_stmts()
-
-	if node.name == 'main' {
-		g.write_indent()
-		g.sb.writeln('return 0;')
-	}
-	g.indent--
-	g.sb.writeln('}')
+	escaped_tail := escape_c_string_literal_segment(raw[start..])
+	sb.write_u8(`"`)
+	sb.write_string(escaped_tail)
+	sb.write_u8(`"`)
+	return sb.str()
 }
 
-fn (mut g Gen) gen_stmts(stmts []ast.Stmt) {
-	for s in stmts {
-		g.gen_stmt(s)
-	}
+fn c_v_string_expr_from_ptr_len(ptr_expr string, len_expr string, is_lit bool) string {
+	return '(string){.str = ${ptr_expr}, .len = ${len_expr}, .is_lit = ${if is_lit {
+		1
+	} else {
+		0
+	}}}'
 }
 
-fn (mut g Gen) gen_stmt(node ast.Stmt) {
-	match node {
-		ast.AssignStmt {
-			// Handle multi-return assignments: a, b := func()
-			if node.lhs.len > 1 && node.rhs.len == 1 && node.op == .decl_assign {
-				g.gen_multi_return_assign(node)
-				return
-			}
-			lhs := node.lhs[0]
-			rhs := node.rhs[0]
-			// Check if LHS is blank identifier '_'
-			mut is_blank := false
-			if lhs is ast.Ident {
-				if lhs.name == '_' {
-					is_blank = true
-				}
-			}
-			if is_blank {
-				// Skip blank identifier assignments, but evaluate RHS for side effects
-				g.write_indent()
-				g.sb.write_string('(void)(')
-				g.gen_expr(rhs)
-				g.sb.writeln(');')
-				return
-			}
-			g.write_indent()
-			if node.op == .decl_assign {
-				// var decl
-				mut name := ''
-				if lhs is ast.Ident {
-					name = lhs.name
-				} else if lhs is ast.ModifierExpr {
-					// Handle mut x := ...
-					if lhs.expr is ast.Ident {
-						name = lhs.expr.name
-					}
-				}
-				typ := g.infer_type(rhs)
-				g.var_types[name] = typ
-				g.sb.write_string('${typ} ${name} = ')
-				g.gen_expr(rhs)
-				g.sb.writeln(';')
-			} else {
-				// assignment
-				// Check if LHS is a map index expression
-				if lhs is ast.IndexExpr {
-					lhs_type := g.infer_type(lhs.lhs)
-					if lhs_type.starts_with('Map_') {
-						// Map assignment: __map_int_int_set(&m, key, val)
-						g.sb.write_string('__map_int_int_set(&')
-						g.gen_expr(lhs.lhs)
-						g.sb.write_string(', ')
-						g.gen_expr(lhs.expr)
-						g.sb.write_string(', ')
-						g.gen_expr(rhs)
-						g.sb.writeln(');')
-						return
-					}
-				}
-				g.gen_expr(lhs)
-				op_str := match node.op {
-					.assign { '=' }
-					.plus_assign { '+=' }
-					.minus_assign { '-=' }
-					.mul_assign { '*=' }
-					.div_assign { '/=' }
-					.mod_assign { '%=' }
-					.and_assign { '&=' }
-					.or_assign { '|=' }
-					.xor_assign { '^=' }
-					.left_shift_assign { '<<=' }
-					.right_shift_assign { '>>=' }
-					else { '=' }
-				}
-				g.sb.write_string(' ${op_str} ')
-				g.gen_expr(rhs)
-				g.sb.writeln(';')
-			}
-		}
-		ast.ExprStmt {
-			g.write_indent()
-			g.gen_expr(node.expr)
-			g.sb.writeln(';')
-		}
-		ast.ReturnStmt {
-			// Handle multi-return: return a, b -> return (Tuple_N_int){a, b}
-			if node.exprs.len > 1 {
-				// Emit deferred statements first (if any)
-				g.emit_deferred_stmts()
-				g.write_indent()
-				g.sb.write_string('return (Tuple_${node.exprs.len}_int){')
-				for i, expr in node.exprs {
-					if i > 0 {
-						g.sb.write_string(', ')
-					}
-					g.gen_expr(expr)
-				}
-				g.sb.writeln('};')
-			} else if node.exprs.len > 0 && g.defer_stmts.len > 0 {
-				// In V/Go semantics: evaluate return value FIRST, then run defer
-				// Store return value in temp variable before running defers
-				ret_type := g.infer_type(node.exprs[0])
-				g.write_indent()
-				g.sb.write_string('${ret_type} __ret_val = ')
-				g.gen_expr(node.exprs[0])
-				g.sb.writeln(';')
-				// Emit deferred statements
-				g.emit_deferred_stmts()
-				// Return the stored value
-				g.write_indent()
-				g.sb.writeln('return __ret_val;')
-			} else {
-				// Emit deferred statements (if any)
-				g.emit_deferred_stmts()
-				g.write_indent()
-				g.sb.write_string('return')
-				if node.exprs.len > 0 {
-					g.sb.write_string(' ')
-					g.gen_expr(node.exprs[0])
-				}
-				g.sb.writeln(';')
-			}
-		}
-		ast.DeferStmt {
-			// Collect deferred statements to be executed before return
-			g.defer_stmts << node.stmts
-		}
-		ast.BlockStmt {
-			g.write_indent()
-			g.sb.writeln('{')
-			g.indent++
-			g.gen_stmts(node.stmts)
-			g.indent--
-			g.write_indent()
-			g.sb.writeln('}')
-		}
-		ast.ForStmt {
-			// Check for for-in: `for i in 1..10` or `for elem in array`
-			if node.init is ast.ForInStmt {
-				g.gen_for_in(node, node.init)
-				return
-			}
-
-			g.write_indent()
-			if node.init is ast.EmptyStmt && node.cond is ast.EmptyExpr
-				&& node.post is ast.EmptyStmt {
-				g.sb.writeln('while (1) {')
-			} else if node.init is ast.EmptyStmt && node.post is ast.EmptyStmt {
-				g.sb.write_string('while (')
-				g.gen_expr(node.cond)
-				g.sb.writeln(') {')
-			} else {
-				g.sb.write_string('for (')
-				if node.init !is ast.EmptyStmt {
-					g.gen_stmt_inline(node.init)
-				}
-				g.sb.write_string('; ')
-				if node.cond !is ast.EmptyExpr {
-					g.gen_expr(node.cond)
-				}
-				g.sb.write_string('; ')
-				if node.post !is ast.EmptyStmt {
-					g.gen_stmt_inline(node.post)
-				}
-				g.sb.writeln(') {')
-			}
-			g.indent++
-			g.gen_stmts(node.stmts)
-			g.indent--
-			g.write_indent()
-			g.sb.writeln('}')
-		}
-		ast.FlowControlStmt {
-			g.write_indent()
-			if node.op == .key_break {
-				g.sb.writeln('break;')
-			} else {
-				g.sb.writeln('continue;')
-			}
-		}
-		ast.AssertStmt {
-			g.write_indent()
-			g.sb.write_string('if (!(')
-			g.gen_expr(node.expr)
-			g.sb.writeln(')) { fprintf(stderr, "Assertion failed\\n"); exit(1); }')
-		}
-		ast.LabelStmt {
-			// Labels for labeled loops (break/continue targets)
-			// Generate: label_name: stmt
-			g.write_indent()
-			g.sb.write_string('${node.name}:')
-			if node.stmt !is ast.EmptyStmt {
-				g.sb.writeln('')
-				g.gen_stmt(node.stmt)
-			} else {
-				g.sb.writeln(';')
-			}
-		}
-		else {
-			g.sb.writeln('// Unhandled stmt: ${node.type_name()}')
-		}
-	}
+fn c_static_v_string_expr_from_c_literal(c_lit string) string {
+	return c_v_string_expr_from_ptr_len(c_lit, 'sizeof(${c_lit}) - 1', true)
 }
 
-fn (mut g Gen) gen_stmt_inline(node ast.Stmt) {
-	match node {
-		ast.AssignStmt {
-			lhs := node.lhs[0]
-			rhs := node.rhs[0]
-			if node.op == .decl_assign {
-				mut name := ''
-				if lhs is ast.Ident {
-					name = lhs.name
-				}
-				t := g.infer_type(rhs)
-				g.var_types[name] = t
-				g.sb.write_string('${t} ${name} = ')
-				g.gen_expr(rhs)
-			} else {
-				g.gen_expr(lhs)
-				op := match node.op {
-					.assign { '=' }
-					.plus_assign { '+=' }
-					.minus_assign { '-=' }
-					else { '=' }
-				}
-				g.sb.write_string(' ${op} ')
-				g.gen_expr(rhs)
-			}
-		}
-		ast.ExprStmt {
-			g.gen_expr(node.expr)
-		}
-		else {}
-	}
+fn mangle_alias_component(name string) string {
+	mut s := name.replace('*', 'ptr')
+	s = s.replace('&', 'ref')
+	s = s.replace(' ', '_')
+	s = s.replace('.', '__')
+	return s
 }
 
-fn (mut g Gen) gen_expr(node ast.Expr) {
-	match node {
-		ast.BasicLiteral {
-			if node.kind == .key_true {
-				g.sb.write_string('true')
-			} else if node.kind == .key_false {
-				g.sb.write_string('false')
-			} else {
-				g.sb.write_string(node.value)
-			}
-		}
-		ast.StringLiteral {
-			if node.value.starts_with("c'") {
-				val := node.value.trim("c'").trim("'")
-				g.sb.write_string('"${val}"')
-			} else {
-				val := node.value.trim("'").trim('"')
-				g.sb.write_string('(string){"${val}", ${val.len}}')
-			}
-		}
-		ast.StringInterLiteral {
-			// String interpolation: 'prefix${a}middle${b}suffix'
-			// Generate: ({ char buf[256]; sprintf(buf, "prefix%lldmiddle%lldsuffix", a, b); (string){buf, strlen(buf)}; })
-			g.sb.write_string('({ char _buf[256]; sprintf(_buf, "')
-			// Build format string
-			for i, val in node.values {
-				// Strip quotes from the first and last value parts
-				mut clean_val := val
-				if i == 0 {
-					// First part: strip leading quote
-					clean_val = clean_val.trim_left("'").trim_left('"')
-				}
-				if i == node.values.len - 1 {
-					// Last part: strip trailing quote
-					clean_val = clean_val.trim_right("'").trim_right('"')
-				}
-				g.sb.write_string(clean_val)
-				if i < node.inters.len {
-					inter := node.inters[i]
-					g.sb.write_string(g.get_printf_format(inter))
-				}
-			}
-			g.sb.write_string('"')
-			// Add arguments
-			for inter in node.inters {
-				g.sb.write_string(', ')
-				g.gen_expr(inter.expr)
-			}
-			g.sb.write_string('); (string){_buf, strlen(_buf)}; })')
-		}
-		ast.Ident {
-			g.sb.write_string(node.name)
-		}
-		ast.ParenExpr {
-			g.sb.write_string('(')
-			g.gen_expr(node.expr)
-			g.sb.write_string(')')
-		}
-		ast.PrefixExpr {
-			// Check for heap allocation: &StructType{...}
-			if node.op == .amp && node.expr is ast.InitExpr {
-				// Heap allocation using a helper macro or inline malloc
-				init_expr := node.expr as ast.InitExpr
-				typ_name := g.expr_type_to_c(init_expr.typ)
-				// Use a compound literal approach - create on heap
-				g.sb.write_string('({ ${typ_name}* _tmp = (${typ_name}*)malloc(sizeof(${typ_name})); *_tmp = (${typ_name}){')
-				for i, field in init_expr.fields {
-					if i > 0 {
-						g.sb.write_string(', ')
-					}
-					g.sb.write_string('.${field.name} = ')
-					g.gen_expr(field.value)
-				}
-				g.sb.write_string('}; _tmp; })')
-				return
-			}
-			op := match node.op {
-				.minus { '-' }
-				.not { '!' }
-				.amp { '&' }
-				.mul { '*' }
-				.bit_not { '~' }
-				else { '' }
-			}
-			g.sb.write_string(op)
-			g.gen_expr(node.expr)
-		}
-		ast.IfExpr {
-			// Check if this if-expression can be converted to a ternary operator
-			// (i.e., used as a value rather than a statement)
-			if g.can_be_ternary(node) {
-				// Generate C ternary: (cond) ? true_val : false_val
-				g.sb.write_string('(')
-				g.gen_expr(node.cond)
-				g.sb.write_string(') ? (')
-				g.gen_if_value(node.stmts)
-				g.sb.write_string(') : (')
-				g.gen_else_value(node.else_expr)
-				g.sb.write_string(')')
-				return
-			}
+fn zero_value_for_type(t string) string {
+	trimmed := t.trim_space()
+	if trimmed == '' {
+		return '0'
+	}
+	if trimmed == 'string' {
+		return c_empty_v_string_expr()
+	}
+	if trimmed.ends_with('*') {
+		return '0'
+	}
+	if trimmed in primitive_types || trimmed in ['void*', 'char*', 'byteptr', 'charptr', 'voidptr'] {
+		return '0'
+	}
+	return '((${trimmed}){0})'
+}
 
-			// Statement IF
-			// First check if this is just an else block (no condition)
-			if node.cond is ast.EmptyExpr {
-				// This is a pure else block, just output the statements
-				g.sb.writeln('{')
-				g.indent++
-				g.gen_stmts(node.stmts)
-				g.indent--
-				g.write_indent()
-				g.sb.writeln('}')
-				return
+fn split_top_level_csv(s string) []string {
+	mut parts := []string{}
+	mut start := 0
+	mut depth := 0
+	for i, ch in s {
+		if ch == `(` || ch == `[` || ch == `<` {
+			depth++
+		} else if ch == `)` || ch == `]` || ch == `>` {
+			if depth > 0 {
+				depth--
 			}
+		} else if ch == `,` && depth == 0 {
+			part := s[start..i].trim_space()
+			if part != '' {
+				parts << part
+			}
+			start = i + 1
+		}
+	}
+	last := s[start..].trim_space()
+	if last != '' {
+		parts << last
+	}
+	return parts
+}
 
-			// Check if condition is an if-guard expression
-			if node.cond is ast.IfGuardExpr {
-				g.gen_if_guard(node, node.cond)
-				return
-			}
-
-			g.write_indent()
-			g.sb.write_string('if (')
-			g.gen_expr(node.cond)
-			g.sb.writeln(') {')
-			g.indent++
-			g.gen_stmts(node.stmts)
-			g.indent--
-			g.write_indent()
-			g.sb.write_string('}')
-			if node.else_expr !is ast.EmptyExpr {
-				if node.else_expr is ast.IfExpr {
-					// Check if this is else-if or pure else
-					if node.else_expr.cond is ast.EmptyExpr {
-						// Pure else block
-						g.sb.writeln(' else {')
-						g.indent++
-						g.gen_stmts(node.else_expr.stmts)
-						g.indent--
-						g.write_indent()
-						g.sb.writeln('}')
-					} else {
-						// Else-if chain
-						g.sb.write_string(' else ')
-						g.gen_expr(node.else_expr)
-					}
-				} else {
-					// Some other expression in else
-					g.sb.write_string(' else ')
-					g.gen_expr(node.else_expr)
-				}
-			} else {
-				g.sb.writeln('')
-			}
+fn (mut g Gen) gen_keyword(node ast.Keyword) {
+	match node.tok {
+		.key_nil {
+			g.sb.write_string('NULL')
 		}
-		ast.MatchExpr {
-			g.write_indent()
-			g.sb.write_string('switch (')
-			g.gen_expr(node.expr)
-			g.sb.writeln(') {')
-			// Set match type context for enum shorthand (.value syntax)
-			match_type := g.infer_type(node.expr)
-			old_match_type := g.cur_match_type
-			g.cur_match_type = match_type
-			for branch in node.branches {
-				if branch.cond.len == 0 {
-					g.write_indent()
-					g.sb.writeln('default:')
-				} else {
-					for c in branch.cond {
-						g.write_indent()
-						g.sb.write_string('case ')
-						g.gen_expr(c)
-						g.sb.writeln(':')
-					}
-				}
-				g.indent++
-				g.gen_stmts(branch.stmts)
-				g.write_indent()
-				g.sb.writeln('break;')
-				g.indent--
-			}
-			g.cur_match_type = old_match_type
-			g.write_indent()
-			g.sb.writeln('}')
-		}
-		ast.InfixExpr {
-			g.sb.write_string('(')
-			g.gen_expr(node.lhs)
-			op := match node.op {
-				.plus { '+' }
-				.minus { '-' }
-				.mul { '*' }
-				.div { '/' }
-				.mod { '%' }
-				.gt { '>' }
-				.lt { '<' }
-				.eq { '==' }
-				.ne { '!=' }
-				.ge { '>=' }
-				.le { '<=' }
-				.and { '&&' }
-				.logical_or { '||' }
-				.amp { '&' }
-				.pipe { '|' }
-				.xor { '^' }
-				.left_shift { '<<' }
-				.right_shift { '>>' }
-				else { '?' }
-			}
-			g.sb.write_string(' ${op} ')
-			g.gen_expr(node.rhs)
-			g.sb.write_string(')')
-		}
-		ast.CallExpr {
-			mut name := ''
-			mut is_method := false
-			mut receiver_expr := ast.empty_expr
-			if node.lhs is ast.Ident {
-				name = node.lhs.name
-			} else if node.lhs is ast.SelectorExpr {
-				// Check if this is a C library call (C.putchar, C.puts, etc.)
-				if node.lhs.lhs is ast.Ident {
-					if node.lhs.lhs.name == 'C' {
-						// C library function call
-						name = node.lhs.rhs.name
-						is_method = false
-					} else {
-						// Regular method call: obj.method(args)
-						name = node.lhs.rhs.name
-						receiver_expr = node.lhs.lhs
-						is_method = true
-					}
-				} else {
-					// Chained selector, treat as method call
-					name = node.lhs.rhs.name
-					receiver_expr = node.lhs.lhs
-					is_method = true
-				}
-			}
-
-			// Handle C function calls (C.puts, C.putchar, etc.) - fallback
-			if name.starts_with('C.') {
-				name = name[2..] // Strip the 'C.' prefix
-			}
-
-			if is_method {
-				// Determine the receiver type to mangle the method name
-				receiver_type := g.infer_type(receiver_expr)
-				receiver_is_ptr := receiver_type.ends_with('*')
-				// Clean up pointer prefix for type lookup
-				clean_type := if receiver_is_ptr {
-					receiver_type[..receiver_type.len - 1]
-				} else {
-					receiver_type
-				}
-
-				// Check if receiver is an interface type - call through vtable
-				if clean_type in g.interface_names {
-					// Interface method call: iface.method(args)
-					// Generate: iface.method(iface._object, args)
-					g.gen_expr(receiver_expr)
-					g.sb.write_string('.${name}(')
-					g.gen_expr(receiver_expr)
-					g.sb.write_string('._object')
-					if node.args.len > 0 {
-						g.sb.write_string(', ')
-					}
-					for i, arg in node.args {
-						if i > 0 {
-							g.sb.write_string(', ')
-						}
-						if arg is ast.ModifierExpr {
-							if arg.kind == .key_mut {
-								g.sb.write_string('&')
-								g.gen_expr(arg.expr)
-							} else {
-								g.gen_expr(arg)
-							}
-						} else {
-							g.gen_expr(arg)
-						}
-					}
-					g.sb.write_string(')')
-					return
-				}
-
-				mangled := '${clean_type}__${name}'
-				method_wants_mut := g.mut_receivers[mangled] or { false }
-
-				g.sb.write_string('${mangled}(')
-
-				// Handle receiver passing:
-				// - Method wants mut receiver: pass &receiver (or receiver if already ptr)
-				// - Method wants non-mut receiver: pass receiver (or *receiver if ptr)
-				if method_wants_mut {
-					if receiver_is_ptr {
-						// Already a pointer, pass as-is
-						g.gen_expr(receiver_expr)
-					} else {
-						// Need to pass address
-						g.sb.write_string('&')
-						g.gen_expr(receiver_expr)
-					}
-				} else {
-					if receiver_is_ptr {
-						// Need to dereference
-						g.sb.write_string('*')
-						g.gen_expr(receiver_expr)
-					} else {
-						// Pass by value
-						g.gen_expr(receiver_expr)
-					}
-				}
-
-				if node.args.len > 0 {
-					g.sb.write_string(', ')
-				}
-			} else {
-				g.sb.write_string('${name}(')
-			}
-			for i, arg in node.args {
-				if i > 0 {
-					g.sb.write_string(', ')
-				}
-				// Check if the argument is a mut parameter (ModifierExpr with mut)
-				if arg is ast.ModifierExpr {
-					if arg.kind == .key_mut {
-						g.sb.write_string('&')
-						g.gen_expr(arg.expr)
-					} else {
-						g.gen_expr(arg)
-					}
-				} else {
-					g.gen_expr(arg)
-				}
-			}
-			g.sb.write_string(')')
-		}
-		ast.CallOrCastExpr {
-			// This is a call that looks like a cast, e.g., fib(n-1) or int(color)
-			mut name := ''
-			if node.lhs is ast.Ident {
-				name = node.lhs.name
-				// Check if this is a primitive type cast (int, i64, etc.)
-				// For enums, int(enum_val) just returns the value since C enums are ints
-				if name in ['int', 'i64', 'i32', 'i16', 'i8', 'u64', 'u32', 'u16', 'u8', 'f32',
-					'f64'] {
-					g.sb.write_string('((${name})(')
-					g.gen_expr(node.expr)
-					g.sb.write_string('))')
-					return
-				}
-				// Check if this is interface boxing: Drawable(point)
-				if name in g.interface_names {
-					// Get the concrete type being boxed
-					concrete_type := g.infer_type(node.expr)
-					// Generate interface struct initialization with vtable
-					g.sb.write_string('({ ')
-					// Allocate heap memory for the object
-					g.sb.write_string('${concrete_type}* _iface_obj = (${concrete_type}*)malloc(sizeof(${concrete_type})); ')
-					g.sb.write_string('*_iface_obj = ')
-					g.gen_expr(node.expr)
-					g.sb.write_string('; ')
-					// Create interface struct with function pointers
-					g.sb.write_string('(${name}){._object = _iface_obj, ._type_id = 0')
-					// Add function pointers for each interface method
-					if methods := g.interface_meths[name] {
-						for meth in methods {
-							g.sb.write_string(', .${meth} = ${name}_${concrete_type}_${meth}_wrapper')
-						}
-					}
-					g.sb.write_string('}; })')
-					return
-				}
-			} else if node.lhs is ast.SelectorExpr {
-				// Check for C library call (C.putchar, etc.)
-				if node.lhs.lhs is ast.Ident && node.lhs.lhs.name == 'C' {
-					name = node.lhs.rhs.name
-				} else {
-					// Method call - this shouldn't happen in CallOrCastExpr typically
-					name = node.lhs.rhs.name
-				}
-			}
-			g.sb.write_string('${name}(')
-			// Check if the argument is a mut parameter (ModifierExpr with mut)
-			if node.expr is ast.ModifierExpr {
-				if node.expr.kind == .key_mut {
-					g.sb.write_string('&')
-					g.gen_expr(node.expr.expr)
-				} else {
-					g.gen_expr(node.expr)
-				}
-			} else {
-				g.gen_expr(node.expr)
-			}
-			g.sb.write_string(')')
-		}
-		ast.InitExpr {
-			// Check if it's a map type
-			if node.typ is ast.Type {
-				if node.typ is ast.MapType {
-					// Generate empty map initialization
-					g.sb.write_string('__new_map_int_int()')
-					return
-				}
-			}
-			// Get the type name properly
-			typ_name := g.expr_type_to_c(node.typ)
-			g.sb.write_string('(${typ_name}){')
-			for i, field in node.fields {
-				if i > 0 {
-					g.sb.write_string(', ')
-				}
-				g.sb.write_string('.${field.name} = ')
-				g.gen_expr(field.value)
-			}
-			g.sb.write_string('}')
-		}
-		ast.SelectorExpr {
-			// Check if this is an enum value access (EnumName.value)
-			if node.lhs is ast.Ident {
-				if node.lhs.name in g.enum_names {
-					// Enum value access: generate EnumName__field
-					g.sb.write_string('${node.lhs.name}__${node.rhs.name}')
-					return
-				}
-			}
-			// Check for enum shorthand (.value) - LHS is EmptyExpr
-			if node.lhs is ast.EmptyExpr {
-				// Use the match expression type context
-				if g.cur_match_type in g.enum_names {
-					g.sb.write_string('${g.cur_match_type}__${node.rhs.name}')
-					return
-				}
-				// Fallback: just output the field name (might not be valid C)
-				g.sb.write_string('${node.rhs.name}')
-				return
-			}
-			// Check if we need to use -> for pointers
-			lhs_type := g.infer_type(node.lhs)
-			g.gen_expr(node.lhs)
-			if lhs_type.ends_with('*') {
-				g.sb.write_string('->')
-			} else {
-				g.sb.write_string('.')
-			}
-			g.sb.write_string(node.rhs.name)
-		}
-		ast.IndexExpr {
-			// Check if this is a slice operation (arr[start..end])
-			if node.expr is ast.RangeExpr {
-				g.gen_slice_expr(node.lhs, node.expr)
-				return
-			}
-			// Check if this is an array access (Array struct type)
-			lhs_type := g.infer_type(node.lhs)
-			if lhs_type.starts_with('Map_') {
-				// Map access: __map_int_int_get(&m, key)
-				g.sb.write_string('__map_int_int_get(&')
-				g.gen_expr(node.lhs)
-				g.sb.write_string(', ')
-				g.gen_expr(node.expr)
-				g.sb.write_string(')')
-			} else if lhs_type.starts_with('Array_') {
-				// For Array types, access via ((elem_type*)arr.data)[index]
-				elem_type := lhs_type['Array_'.len..]
-				g.sb.write_string('((${elem_type}*)')
-				g.gen_expr(node.lhs)
-				g.sb.write_string('.data)[')
-				g.gen_expr(node.expr)
-				g.sb.write_string(']')
-			} else {
-				// Regular C array access
-				g.gen_expr(node.lhs)
-				g.sb.write_string('[')
-				g.gen_expr(node.expr)
-				g.sb.write_string(']')
-			}
-		}
-		ast.PostfixExpr {
-			g.gen_expr(node.expr)
-			if node.op == .inc {
-				g.sb.write_string('++')
-			} else {
-				g.sb.write_string('--')
-			}
-		}
-		ast.ModifierExpr {
-			// Handle mut, shared, etc.
-			g.gen_expr(node.expr)
-		}
-		ast.ArrayInitExpr {
-			// Generate array using __new_array_from_c_array builtin
-			len := node.exprs.len
-			elem_type := if len > 0 { g.infer_type(node.exprs[0]) } else { 'int' }
-			// __new_array_from_c_array(len, len, sizeof(elem), (elem_type[len]){values})
-			g.sb.write_string('__new_array_from_c_array(${len}, ${len}, sizeof(${elem_type}), (${elem_type}[${len}]){')
-			for i, expr in node.exprs {
-				if i > 0 {
-					g.sb.write_string(', ')
-				}
-				g.gen_expr(expr)
-			}
-			g.sb.write_string('})')
-		}
-		ast.MapInitExpr {
-			// Generate empty map initialization
-			g.sb.write_string('__new_map_int_int()')
-		}
-		ast.IfGuardExpr {
-			// If-guard expression: `if x := opt() { ... }`
-			// For cleanc, we generate the RHS expression and use it as condition
-			// The variable binding is handled in the if-statement context
-			if node.stmt.rhs.len > 0 {
-				g.gen_expr(node.stmt.rhs[0])
-			} else {
-				g.sb.write_string('0')
-			}
-		}
-		ast.Keyword {
-			// Handle keywords like 'none'
-			if node.tok == .key_none {
-				g.sb.write_string('0') // none is represented as 0/NULL
-			} else if node.tok == .key_true {
-				g.sb.write_string('true')
-			} else if node.tok == .key_false {
-				g.sb.write_string('false')
-			} else {
-				g.sb.write_string('/* keyword: ${node.tok} */')
-			}
-		}
-		ast.Type {
-			// Handle type expressions (e.g., in return statements)
-			if node is ast.NoneType {
-				g.sb.write_string('0') // none
-			} else {
-				g.sb.write_string('/* type expr */')
-			}
-		}
-		ast.RangeExpr {
-			// RangeExpr: start..end or start...end
-			// Generate a compound literal for the range struct
-			g.sb.write_string('(Range_){')
-			g.gen_expr(node.start)
-			g.sb.write_string(', ')
-			g.gen_expr(node.end)
-			g.sb.write_string('}')
-		}
-		ast.ComptimeExpr {
-			// Handle comptime expressions like $if macos { ... } $else { ... }
-			g.gen_comptime_expr(node)
-		}
-		ast.UnsafeExpr {
-			// Unsafe block - generate as GCC compound expression
-			if node.stmts.len == 0 {
-				g.sb.write_string('0')
-			} else {
-				g.sb.write_string('({ ')
-				// Generate all but last statement
-				for i, stmt in node.stmts {
-					if i < node.stmts.len - 1 {
-						g.gen_stmt(stmt)
-					}
-				}
-				// Generate last statement - if it's an ExprStmt, we need its value
-				last := node.stmts[node.stmts.len - 1]
-				if last is ast.ExprStmt {
-					g.gen_expr(last.expr)
-					g.sb.write_string('; ')
-				} else {
-					g.gen_stmt(last)
-					g.sb.write_string('0; ')
-				}
-				g.sb.write_string('})')
-			}
-		}
-		ast.EmptyExpr {
-			// Empty expression - output nothing or 0
+		.key_none {
 			g.sb.write_string('0')
 		}
-		ast.OrExpr {
-			// Or expression: expr or { fallback }
-			// For now, just generate the main expression
-			// TODO: Add proper optional/error handling
-			g.gen_expr(node.expr)
+		.key_true {
+			g.sb.write_string('true')
+		}
+		.key_false {
+			g.sb.write_string('false')
+		}
+		.key_struct {
+			g.sb.write_string('struct')
 		}
 		else {
-			g.sb.write_string('/* expr: ${node.type_name()} */')
+			g.sb.write_string('0')
 		}
 	}
 }
 
-// gen_comptime_expr handles compile-time conditionals like $if macos { ... } $else { ... }
-fn (mut g Gen) gen_comptime_expr(node ast.ComptimeExpr) {
-	// The inner expression should be an IfExpr
-	if node.expr is ast.IfExpr {
-		g.gen_comptime_if(node.expr)
-	} else {
-		// For other comptime expressions, just emit them
-		g.gen_expr(node.expr)
-	}
-}
-
-// gen_comptime_if handles $if/$else compile-time conditionals
-fn (mut g Gen) gen_comptime_if(node ast.IfExpr) {
-	// Evaluate the comptime condition
-	cond_result := g.eval_comptime_cond(node.cond)
-
-	if cond_result {
-		// Condition is true - emit then branch
-		g.gen_stmts(node.stmts)
-	} else {
-		// Condition is false - emit else branch if present
-		if node.else_expr !is ast.EmptyExpr {
-			if node.else_expr is ast.IfExpr {
-				// Could be $else if or plain $else
-				if node.else_expr.cond is ast.EmptyExpr {
-					// Plain $else block
-					g.gen_stmts(node.else_expr.stmts)
-				} else {
-					// $else $if - recursive comptime evaluation
-					g.gen_comptime_if(node.else_expr)
-				}
-			}
-		}
-	}
-}
-
-// eval_comptime_cond evaluates a compile-time condition expression
-fn (g Gen) eval_comptime_cond(cond ast.Expr) bool {
-	match cond {
-		ast.Ident {
-			// Platform and feature flags
-			return g.eval_comptime_flag(cond.name)
-		}
-		ast.PrefixExpr {
-			// Handle negation: !macos
-			if cond.op == .not {
-				return !g.eval_comptime_cond(cond.expr)
-			}
-		}
-		ast.InfixExpr {
-			// Handle && and ||
-			if cond.op == .and {
-				return g.eval_comptime_cond(cond.lhs) && g.eval_comptime_cond(cond.rhs)
-			}
-			if cond.op == .logical_or {
-				return g.eval_comptime_cond(cond.lhs) || g.eval_comptime_cond(cond.rhs)
-			}
-		}
-		ast.PostfixExpr {
-			// Handle optional feature check: feature?
-			if cond.op == .question {
-				if cond.expr is ast.Ident {
-					return g.eval_comptime_flag(cond.expr.name)
-				}
-			}
-		}
+fn strip_expr_wrappers(expr ast.Expr) ast.Expr {
+	return match expr {
 		ast.ParenExpr {
-			return g.eval_comptime_cond(cond.expr)
+			strip_expr_wrappers(expr.expr)
 		}
-		else {}
-	}
-	return false
-}
-
-// eval_comptime_flag evaluates a single comptime flag/identifier
-fn (g Gen) eval_comptime_flag(name string) bool {
-	// OS checks - use comptime conditionals with direct returns
-	match name {
-		'macos', 'darwin' {
-			$if macos {
-				return true
-			}
-			return false
+		ast.ModifierExpr {
+			strip_expr_wrappers(expr.expr)
 		}
-		'linux' {
-			$if linux {
-				return true
-			}
-			return false
-		}
-		'windows' {
-			$if windows {
-				return true
-			}
-			return false
-		}
-		'freebsd' {
-			$if freebsd {
-				return true
-			}
-			return false
-		}
-		'posix', 'unix' {
-			$if macos {
-				return true
-			} $else $if linux {
-				return true
-			} $else $if freebsd {
-				return true
-			}
-			return false
-		}
-		// Architecture checks
-		'amd64', 'x86_64' {
-			$if amd64 {
-				return true
-			}
-			return false
-		}
-		'arm64', 'aarch64' {
-			$if arm64 {
-				return true
-			}
-			return false
-		}
-		'x86' {
-			// x86 (32-bit) is rarely used in modern systems
-			return false
-		}
-		// Common feature flags (typically false in simple compilers)
-		'freestanding', 'ios', 'android', 'termux', 'debug', 'test' {
-			return false
+		ast.CastExpr {
+			strip_expr_wrappers(expr.expr)
 		}
 		else {
-			// Unknown flag - default to false
-			return false
+			expr
+		}
+	}
+}
+
+fn (mut g Gen) gen_keyword_operator(node ast.KeywordOperator) {
+	match node.op {
+		.key_sizeof {
+			if node.exprs.len > 0 {
+				g.sb.write_string('sizeof(')
+				g.sb.write_string(g.expr_type_to_c(node.exprs[0]))
+				g.sb.write_string(')')
+			} else {
+				g.sb.write_string('0')
+			}
+		}
+		.key_typeof {
+			if node.exprs.len > 0 {
+				type_name := g.expr_type_to_c(node.exprs[0])
+				g.sb.write_string(c_static_v_string_expr(type_name))
+			} else {
+				g.sb.write_string(c_empty_v_string_expr())
+			}
+		}
+		.key_offsetof {
+			if node.exprs.len >= 2 {
+				g.sb.write_string('offsetof(')
+				g.sb.write_string(g.expr_type_to_c(node.exprs[0]))
+				g.sb.write_string(', ')
+				field_expr := node.exprs[1]
+				if field_expr is ast.Ident {
+					g.sb.write_string(field_expr.name)
+				} else {
+					g.expr(field_expr)
+				}
+				g.sb.write_string(')')
+			} else {
+				g.sb.write_string('0')
+			}
+		}
+		.key_isreftype {
+			g.sb.write_string('0')
+		}
+		.key_likely {
+			if node.exprs.len > 0 {
+				g.sb.write_string('__builtin_expect((')
+				g.expr(node.exprs[0])
+				g.sb.write_string('), 1)')
+			} else {
+				g.sb.write_string('1')
+			}
+		}
+		.key_unlikely {
+			if node.exprs.len > 0 {
+				g.sb.write_string('__builtin_expect((')
+				g.expr(node.exprs[0])
+				g.sb.write_string('), 0)')
+			} else {
+				g.sb.write_string('0')
+			}
+		}
+		.key_dump {
+			// dump(expr) - just evaluate the expression
+			if node.exprs.len > 0 {
+				g.expr(node.exprs[0])
+			} else {
+				g.sb.write_string('0')
+			}
+		}
+		else {
+			g.sb.write_string('/* KeywordOperator: ${node.op} */ 0')
 		}
 	}
 }
@@ -1748,391 +937,5 @@ fn (g Gen) eval_comptime_flag(name string) bool {
 fn (mut g Gen) write_indent() {
 	for _ in 0 .. g.indent {
 		g.sb.write_string('\t')
-	}
-}
-
-// Check if an IfExpr can be converted to a C ternary operator
-// This is true when the branches contain simple value expressions (single ExprStmt)
-fn (g Gen) can_be_ternary(node ast.IfExpr) bool {
-	// If-guard expressions cannot be ternary (they need variable declarations)
-	if node.cond is ast.IfGuardExpr {
-		return false
-	}
-	// Must have both branches
-	if node.else_expr is ast.EmptyExpr {
-		return false
-	}
-	// Check if true branch has exactly one ExprStmt with a simple expression
-	if node.stmts.len != 1 {
-		return false
-	}
-	stmt := node.stmts[0]
-	if stmt !is ast.ExprStmt {
-		return false
-	}
-	// Exclude complex expressions that can't be used in ternary (MatchExpr, IfExpr as statement)
-	expr_stmt := stmt as ast.ExprStmt
-	if expr_stmt.expr is ast.MatchExpr {
-		return false
-	}
-	if expr_stmt.expr is ast.IfExpr {
-		// If nested, check if it's also a value expression
-		nested_if := expr_stmt.expr as ast.IfExpr
-		if !g.can_be_ternary(nested_if) {
-			return false
-		}
-	}
-	// Check else branch
-	if node.else_expr is ast.IfExpr {
-		// Could be else-if chain or pure else
-		else_if := node.else_expr
-		if else_if.cond is ast.EmptyExpr {
-			// Pure else: check its statements
-			if else_if.stmts.len != 1 {
-				return false
-			}
-			else_stmt := else_if.stmts[0]
-			if else_stmt !is ast.ExprStmt {
-				return false
-			}
-			else_expr_stmt := else_stmt as ast.ExprStmt
-			if else_expr_stmt.expr is ast.MatchExpr {
-				return false
-			}
-		} else {
-			// Nested if-expression (else if) - can be ternary if nested can
-			return g.can_be_ternary(else_if)
-		}
-	}
-	return true
-}
-
-// Generate the value from the if-branch statements
-fn (mut g Gen) gen_if_value(stmts []ast.Stmt) {
-	if stmts.len == 1 {
-		stmt := stmts[0]
-		if stmt is ast.ExprStmt {
-			g.gen_expr(stmt.expr)
-			return
-		}
-	}
-	g.sb.write_string('0')
-}
-
-// Generate the value from the else-branch expression
-fn (mut g Gen) gen_else_value(else_expr ast.Expr) {
-	if else_expr is ast.IfExpr {
-		if else_expr.cond is ast.EmptyExpr {
-			// Pure else: extract value from its statements
-			g.gen_if_value(else_expr.stmts)
-		} else {
-			// Nested if-expression (else if) - recurse with ternary
-			g.sb.write_string('(')
-			g.gen_expr(else_expr.cond)
-			g.sb.write_string(') ? (')
-			g.gen_if_value(else_expr.stmts)
-			g.sb.write_string(') : (')
-			g.gen_else_value(else_expr.else_expr)
-			g.sb.write_string(')')
-		}
-	} else if else_expr is ast.EmptyExpr {
-		g.sb.write_string('0')
-	} else {
-		g.gen_expr(else_expr)
-	}
-}
-
-// Generate if-guard statement: `if x := opt() { ... } else { ... }`
-fn (mut g Gen) gen_if_guard(node ast.IfExpr, guard ast.IfGuardExpr) {
-	// For if-guard, we:
-	// 1. Declare the guard variable(s)
-	// 2. Assign the RHS to the variable(s)
-	// 3. Use the value as condition (non-zero = success)
-
-	// Get the variable name(s) from LHS
-	mut var_names := []string{}
-	for lhs_expr in guard.stmt.lhs {
-		if lhs_expr is ast.Ident {
-			var_names << lhs_expr.name
-		} else if lhs_expr is ast.ModifierExpr {
-			// Handle 'mut x'
-			if lhs_expr.expr is ast.Ident {
-				var_names << lhs_expr.expr.name
-			}
-		}
-	}
-
-	// Infer type from RHS
-	mut rhs_type := 'int'
-	if guard.stmt.rhs.len > 0 {
-		rhs_type = g.infer_type(guard.stmt.rhs[0])
-	}
-
-	// Generate: { type var = rhs; if (var) { ... } else { ... } }
-	g.sb.writeln('{')
-	g.indent++
-
-	// Declare and assign guard variable(s)
-	for i, var_name in var_names {
-		g.write_indent()
-		g.var_types[var_name] = rhs_type
-		g.sb.write_string('${rhs_type} ${var_name} = ')
-		if i < guard.stmt.rhs.len {
-			g.gen_expr(guard.stmt.rhs[i])
-		} else if guard.stmt.rhs.len > 0 {
-			g.gen_expr(guard.stmt.rhs[0])
-		} else {
-			g.sb.write_string('0')
-		}
-		g.sb.writeln(';')
-	}
-
-	// Generate the if statement using the first variable as condition
-	g.write_indent()
-	if var_names.len > 0 {
-		g.sb.write_string('if (${var_names[0]})')
-	} else {
-		g.sb.write_string('if (0)')
-	}
-	g.sb.writeln(' {')
-	g.indent++
-	g.gen_stmts(node.stmts)
-	g.indent--
-	g.write_indent()
-	g.sb.write_string('}')
-
-	// Handle else branch
-	if node.else_expr !is ast.EmptyExpr {
-		if node.else_expr is ast.IfExpr {
-			if node.else_expr.cond is ast.EmptyExpr {
-				// Pure else block
-				g.sb.writeln(' else {')
-				g.indent++
-				g.gen_stmts(node.else_expr.stmts)
-				g.indent--
-				g.write_indent()
-				g.sb.writeln('}')
-			} else {
-				// Else-if chain
-				g.sb.write_string(' else ')
-				g.gen_expr(node.else_expr)
-			}
-		} else {
-			g.sb.write_string(' else ')
-			g.gen_expr(node.else_expr)
-		}
-	} else {
-		g.sb.writeln('')
-	}
-
-	g.indent--
-	g.write_indent()
-	g.sb.writeln('}')
-}
-
-// Generate for-in loop: dispatches to range or array handling
-fn (mut g Gen) gen_for_in(node ast.ForStmt, for_in ast.ForInStmt) {
-	if for_in.expr is ast.RangeExpr {
-		g.gen_for_in_range(node, for_in)
-	} else {
-		g.gen_for_in_array(node, for_in)
-	}
-}
-
-// Generate for-in loop with range: `for i in start..end { ... }`
-fn (mut g Gen) gen_for_in_range(node ast.ForStmt, for_in ast.ForInStmt) {
-	// Get loop variable name
-	mut var_name := ''
-	if for_in.value is ast.Ident {
-		var_name = for_in.value.name
-	} else if for_in.value is ast.ModifierExpr {
-		if for_in.value.expr is ast.Ident {
-			var_name = for_in.value.expr.name
-		}
-	}
-
-	range_expr := for_in.expr as ast.RangeExpr
-
-	// Register loop variable type
-	g.var_types[var_name] = 'int'
-
-	// Generate: for (int i = start; i < end; i++) { ... }
-	g.write_indent()
-	g.sb.write_string('for (int ${var_name} = ')
-	g.gen_expr(range_expr.start)
-	g.sb.write_string('; ${var_name} < ')
-	g.gen_expr(range_expr.end)
-	g.sb.write_string('; ${var_name}++')
-	g.sb.writeln(') {')
-	g.indent++
-	g.gen_stmts(node.stmts)
-	g.indent--
-	g.write_indent()
-	g.sb.writeln('}')
-}
-
-// Generate for-in loop over array: `for elem in array { ... }` or `for i, elem in array { ... }`
-fn (mut g Gen) gen_for_in_array(node ast.ForStmt, for_in ast.ForInStmt) {
-	// Get key variable name (index)
-	mut key_name := ''
-	if for_in.key !is ast.EmptyExpr {
-		if for_in.key is ast.Ident {
-			key_name = for_in.key.name
-		} else if for_in.key is ast.ModifierExpr {
-			if for_in.key.expr is ast.Ident {
-				key_name = for_in.key.expr.name
-			}
-		}
-	}
-
-	// Get value variable name
-	mut value_name := ''
-	if for_in.value is ast.Ident {
-		value_name = for_in.value.name
-	} else if for_in.value is ast.ModifierExpr {
-		if for_in.value.expr is ast.Ident {
-			value_name = for_in.value.expr.name
-		}
-	}
-
-	// Infer array type
-	arr_type := g.infer_type(for_in.expr)
-
-	// Determine element type
-	mut elem_type := 'int'
-	if arr_type.starts_with('Array_') {
-		elem_type = arr_type['Array_'.len..]
-	}
-
-	// Register variable types
-	g.var_types[value_name] = elem_type
-	if key_name != '' {
-		g.var_types[key_name] = 'int'
-	}
-
-	// Use a hidden index if no key specified
-	idx_var := if key_name != '' { key_name } else { '_idx_${value_name}' }
-
-	g.write_indent()
-	g.sb.write_string('for (int ${idx_var} = 0; ${idx_var} < ')
-	g.gen_expr(for_in.expr)
-	g.sb.writeln('.len; ${idx_var}++) {')
-	g.indent++
-
-	// Declare and assign value variable
-	g.write_indent()
-	g.sb.write_string('${elem_type} ${value_name} = ((${elem_type}*)')
-	g.gen_expr(for_in.expr)
-	g.sb.writeln('.data)[${idx_var}];')
-
-	g.gen_stmts(node.stmts)
-	g.indent--
-	g.write_indent()
-	g.sb.writeln('}')
-}
-
-// Generate array slice expression: arr[start..end]
-fn (mut g Gen) gen_slice_expr(base ast.Expr, range_expr ast.RangeExpr) {
-	// Get the base array type
-	lhs_type := g.infer_type(base)
-
-	if lhs_type.starts_with('Array_') {
-		// For Array struct types
-		elem_type := lhs_type['Array_'.len..]
-		// Generate: __slice_array(arr, start, end, sizeof(elem_type))
-		// For simplicity, generate inline slice creation
-		g.sb.write_string('({ ')
-		g.sb.write_string('int _start = ')
-		g.gen_expr(range_expr.start)
-		g.sb.write_string('; int _end = ')
-		g.gen_expr(range_expr.end)
-		g.sb.write_string('; int _len = _end - _start; ')
-		g.sb.write_string('Array _slice = __new_array_from_c_array(_len, _len, sizeof(${elem_type}), ')
-		g.sb.write_string('((${elem_type}*)')
-		g.gen_expr(base)
-		g.sb.write_string('.data) + _start); _slice; })')
-	} else {
-		// For C-style arrays, return pointer to start
-		g.sb.write_string('(&(')
-		g.gen_expr(base)
-		g.sb.write_string(')[')
-		g.gen_expr(range_expr.start)
-		g.sb.write_string('])')
-	}
-}
-
-// Convert V string interpolation format to C printf format specifier
-fn (g Gen) get_printf_format(inter ast.StringInter) string {
-	base_fmt := match inter.format {
-		.unformatted { '%lld' } // Default: assume integer
-		.decimal { '%lld' }
-		.hex { '%llx' }
-		.octal { '%llo' }
-		.binary { '%lld' } // C doesn't have binary, use decimal
-		.float { '%f' }
-		.exponent { '%e' }
-		.exponent_short { '%g' }
-		.character { '%c' }
-		.string { '%s' }
-		.pointer_address { '%p' }
-	}
-
-	// Handle width and precision if specified
-	if inter.width > 0 && inter.precision > 0 {
-		return '%${inter.width}.${inter.precision}' + base_fmt[1..]
-	} else if inter.width > 0 {
-		return '%${inter.width}' + base_fmt[1..]
-	} else if inter.precision > 0 {
-		return '%.${inter.precision}' + base_fmt[1..]
-	}
-	return base_fmt
-}
-
-// emit_deferred_stmts emits all deferred statements in reverse order
-fn (mut g Gen) emit_deferred_stmts() {
-	// Execute deferred statements in LIFO order (last defer first)
-	for i := g.defer_stmts.len - 1; i >= 0; i-- {
-		g.gen_stmts(g.defer_stmts[i])
-	}
-}
-
-// gen_multi_return_assign handles multi-return assignments like: a, b := func()
-fn (mut g Gen) gen_multi_return_assign(node ast.AssignStmt) {
-	rhs := node.rhs[0]
-
-	// Generate tuple type name based on number of return values
-	tuple_type := 'Tuple_${node.lhs.len}_int'
-
-	// Get a unique temp variable name
-	tmp_name := '__tmp_${g.tmp_counter}'
-	g.tmp_counter++
-
-	// Generate: TupleN_int __tmp = func();
-	g.write_indent()
-	g.sb.write_string('${tuple_type} ${tmp_name} = ')
-	g.gen_expr(rhs)
-	g.sb.writeln(';')
-
-	// Extract each field: int a = __tmp.f0; int b = __tmp.f1;
-	for i, lhs_expr in node.lhs {
-		mut name := ''
-		mut is_blank := false
-		if lhs_expr is ast.Ident {
-			name = lhs_expr.name
-			is_blank = name == '_'
-		} else if lhs_expr is ast.ModifierExpr {
-			if lhs_expr.expr is ast.Ident {
-				name = lhs_expr.expr.name
-				is_blank = name == '_'
-			}
-		}
-
-		if is_blank {
-			continue // Skip blank identifiers
-		}
-
-		g.var_types[name] = 'int' // Simplified - assume int return type
-		g.write_indent()
-		g.sb.writeln('int ${name} = ${tmp_name}.f${i};')
 	}
 }

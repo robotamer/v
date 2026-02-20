@@ -8,7 +8,7 @@ import toml
 import toml.ast
 import x.json2
 
-const test_root = os.join_path(@VROOT, 'vlib/toml/tests/testdata/toml_lang/tests')
+const test_root = os.join_path(@VEXEROOT, 'vlib/toml/tests/testdata/toml_lang/tests')
 const test_files_file = os.join_path(test_root, 'files-toml-1.0.0')
 
 const hide_oks = os.getenv('VTEST_HIDE_OK') == '1'
@@ -142,7 +142,7 @@ fn test_toml_lang_tomltest() {
 				println('OK   [${i + 1}/${valid_test_files.len}] "${valid_test_file}"...')
 			}
 			toml_doc := toml.parse_file(valid_test_file)!
-			// eprintln('                relative: $relative parsed')
+			// eprintln('                relative: ${relative} parsed')
 
 			v_toml_json_path := os.join_path(compare_work_dir_root,
 				os.file_name(valid_test_file).all_before_last('.') + '.v.json')

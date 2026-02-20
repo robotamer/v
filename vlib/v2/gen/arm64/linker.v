@@ -55,7 +55,10 @@ const bind_symbol_flags_weak_import = 0x01
 // V's malloc() wrapper calls C.malloc() which would otherwise resolve
 // back to the V wrapper.
 const force_external_syms = ['_malloc', '_free', '_calloc', '_realloc', '_exit', '_abort', '_memcpy',
-	'_memmove', '_memset', '_memcmp']
+	'_memmove', '_memset', '_memcmp', '___stdoutp', '___stderrp', '_puts', '_printf', '_write',
+	'_read', '_open', '_close', '_fwrite', '_fflush', '_fopen', '_fclose', '_putchar', '_sprintf',
+	'_snprintf', '_fprintf', '_sscanf', '_mmap', '_munmap', '_getcwd', '_access', '_readlink',
+	'_getenv', '_strlen']
 
 pub struct Linker {
 	macho &MachOObject
@@ -118,19 +121,10 @@ pub fn (mut l Linker) link(output_path string, entry_name string) {
 		}
 	}
 
-	// Second pass: collect truly external symbols (undefined and not locally defined)
-	for sym in l.macho.symbols {
-		if sym.type_ == 0x01 { // N_UNDF | N_EXT
-			// Only treat as external if not defined locally
-			if sym.name !in defined_syms && sym.name !in l.extern_syms {
-				l.extern_syms << sym.name
-				l.sym_to_got[sym.name] = l.extern_syms.len - 1
-			}
-		}
-	}
-
-	// Add force_external symbols that are referenced (either as undefined OR defined locally)
-	// These need stubs so that internal calls go to libc, not to local V wrappers
+	// Second pass: collect truly external symbols.
+	// Only force_external_syms (libc functions) should go through GOT/stubs.
+	// All other undefined symbols are internal V functions or V-embedded C functions
+	// (like wyhash) that resolve to local stubs.
 	for sym in l.macho.symbols {
 		if sym.name in force_external_syms && sym.name !in l.extern_syms {
 			l.extern_syms << sym.name
@@ -219,27 +213,83 @@ pub fn (mut l Linker) link(output_path string, entry_name string) {
 	bind_info := l.generate_bind_info()
 	bind_size := bind_info.len
 
-	// Symbol table follows bind info
-	symtab_off := bind_off + bind_size
-	// We'll have minimal symbols
-	n_syms := 0
-	strtab_off := symtab_off + (n_syms * 16)
-	strtab_size := 1 // Just null byte
+	// Build symbol table for internal function names (visible in objdump -d)
+	mut symtab_data := []u8{}
+	mut strtab_data := []u8{}
+	strtab_data << 0 // First byte of string table must be null
 
-	// Code signature follows string table (will be calculated later)
+	sym_code_vmaddr := l.text_vmaddr + u64(l.code_start)
+
+	// Find data section base address (minimum symbol value in sect 3)
+	mut sym_data_base := u64(0xFFFFFFFFFFFFFFFF)
+	for sym in l.macho.symbols {
+		if (sym.type_ & 0x0E) == 0x0E && sym.sect == 3 {
+			if sym.value < sym_data_base {
+				sym_data_base = sym.value
+			}
+		}
+	}
+	if sym_data_base == 0xFFFFFFFFFFFFFFFF {
+		sym_data_base = u64(l.macho.text_data.len + l.macho.str_data.len)
+	}
+
+	for sym in l.macho.symbols {
+		if (sym.type_ & 0x0E) != 0x0E {
+			continue // Skip undefined symbols
+		}
+		if sym.name in force_external_syms {
+			continue
+		}
+
+		mut vm_addr := u64(0)
+		mut out_sect := u8(0)
+		if sym.sect == 1 {
+			// __text section
+			vm_addr = sym_code_vmaddr + sym.value
+			out_sect = 1
+		} else if sym.sect == 3 {
+			// __data section
+			vm_addr = l.data_vmaddr + (sym.value - sym_data_base)
+			out_sect = 3
+		} else {
+			continue
+		}
+
+		str_idx := strtab_data.len
+		strtab_data << sym.name.bytes()
+		strtab_data << 0
+
+		write_u32_le(mut symtab_data, u32(str_idx)) // n_strx
+		symtab_data << sym.type_ // n_type
+		symtab_data << out_sect // n_sect
+		write_u16_le(mut symtab_data, sym.desc) // n_desc
+		write_u64_le(mut symtab_data, vm_addr) // n_value
+	}
+
+	// Symbol table follows bind info and must be aligned in LINKEDIT.
+	symtab_unaligned_off := bind_off + bind_size
+	symtab_off := (symtab_unaligned_off + 7) & ~7
+	symtab_pad := symtab_off - symtab_unaligned_off
+	n_syms := symtab_data.len / 16
+	strtab_off := symtab_off + symtab_data.len
+	strtab_size := strtab_data.len
+
+	// Code signature follows string table and should be aligned in LINKEDIT.
+	code_limit_unaligned := strtab_off + strtab_size
+	cs_off := (code_limit_unaligned + 15) & ~15
+	cs_pad := cs_off - code_limit_unaligned
 	// code_limit is where the signature starts (everything before is hashed)
-	code_limit := strtab_off + strtab_size
+	code_limit := cs_off
 	// Signature size: SuperBlob(12) + 2*BlobIndex(8) + CodeDirectory header + identifier + hashes + Requirements blob
 	ident := output_path.all_after_last('/') // Use filename as identifier
 	cs_size := l.estimate_signature_size(code_limit, ident)
-	cs_off := code_limit
 
 	l.linkedit_off = bind_off
-	l.linkedit_size = bind_size + strtab_size + cs_size
+	l.linkedit_size = bind_size + symtab_pad + symtab_data.len + strtab_size + cs_pad + cs_size
 
 	l.write_dyld_info(bind_off, bind_size)
 	l.write_symtab(symtab_off, n_syms, strtab_off, strtab_size)
-	l.write_dysymtab()
+	l.write_dysymtab(n_syms)
 	l.write_load_dylinker()
 	l.write_load_dylib()
 
@@ -292,9 +342,16 @@ pub fn (mut l Linker) link(output_path string, entry_name string) {
 
 	// Write LINKEDIT content
 	l.buf << bind_info
+	l.write_zeros(symtab_pad)
 
-	// Write string table (just null byte)
-	l.buf << 0
+	// Write symbol table nlist entries
+	l.buf << symtab_data
+
+	// Write string table
+	l.buf << strtab_data
+
+	// Align code signature start in LINKEDIT.
+	l.write_zeros(cs_pad)
 
 	println('  padding+data: ${time.since(t)}')
 	t = time.now()
@@ -319,8 +376,14 @@ pub fn (mut l Linker) link(output_path string, entry_name string) {
 
 	// Make executable
 	os.chmod(output_path, 0o755) or {}
+	l.codesign_output(output_path)
 
 	println('  TOTAL linker: ${time.since(t_total)}')
+}
+
+fn (l Linker) codesign_output(output_path string) {
+	// Skip external codesign — our built-in ad-hoc signature is sufficient
+	// and codesign -s - -f can rewrite the binary layout, breaking stub→GOT references
 }
 
 fn (mut l Linker) write_header(ncmds int, cmdsize int) {
@@ -485,12 +548,27 @@ fn (mut l Linker) write_symtab(symoff int, nsyms int, stroff int, strsize int) {
 	write_u32_le(mut l.buf, u32(strsize))
 }
 
-fn (mut l Linker) write_dysymtab() {
+fn (mut l Linker) write_dysymtab(_nsyms int) {
 	write_u32_le(mut l.buf, u32(lc_dysymtab))
 	write_u32_le(mut l.buf, 80)
-	for _ in 0 .. 18 {
-		write_u32_le(mut l.buf, 0)
-	}
+	write_u32_le(mut l.buf, 0) // ilocalsym
+	write_u32_le(mut l.buf, 0) // nlocalsym
+	write_u32_le(mut l.buf, 0) // iextdefsym
+	write_u32_le(mut l.buf, 0) // nextdefsym
+	write_u32_le(mut l.buf, 0) // iundefsym
+	write_u32_le(mut l.buf, 0) // nundefsym
+	write_u32_le(mut l.buf, 0) // tocoff
+	write_u32_le(mut l.buf, 0) // ntoc
+	write_u32_le(mut l.buf, 0) // modtaboff
+	write_u32_le(mut l.buf, 0) // nmodtab
+	write_u32_le(mut l.buf, 0) // extrefsymoff
+	write_u32_le(mut l.buf, 0) // nextrefsyms
+	write_u32_le(mut l.buf, 0) // indirectsymoff
+	write_u32_le(mut l.buf, 0) // nindirectsyms
+	write_u32_le(mut l.buf, 0) // extreloff
+	write_u32_le(mut l.buf, 0) // nextrel
+	write_u32_le(mut l.buf, 0) // locreloff
+	write_u32_le(mut l.buf, 0) // nlocrel
 }
 
 fn (mut l Linker) write_load_dylinker() {
@@ -723,11 +801,19 @@ fn (mut l Linker) generate_bind_info() []u8 {
 	data_seg_idx := u8(2)
 
 	for i, sym_name in l.extern_syms {
+		// Internal runtime callback names can appear as unresolved function refs in
+		// bootstrap builds. Bind them as weak imports so dyld does not abort load
+		// when they are absent from libSystem; unresolved weak symbols become NULL.
+		mut bind_flags := u8(0)
+		if sym_name.contains('__') && sym_name !in force_external_syms {
+			bind_flags = bind_symbol_flags_weak_import
+		}
+
 		// Set dylib ordinal (1 = first dylib = libSystem)
 		info << (bind_opcode_set_dylib_ordinal_imm | 1)
 
 		// Set symbol name
-		info << (bind_opcode_set_symbol_flags_imm | 0)
+		info << (bind_opcode_set_symbol_flags_imm | bind_flags)
 		info << sym_name.bytes()
 		info << 0 // null terminator
 
@@ -801,19 +887,19 @@ fn (mut l Linker) write_text_with_relocations() {
 		// N_SECT (0x0E) means symbol is defined in a section
 		if (sym.type_ & 0x0E) == 0x0E {
 			// Skip force_external symbols - they should always resolve to libc
-			is_force_external := sym.name in force_external_syms
+			is_external := sym.name in force_external_syms
 			if sym.sect == 1 {
 				// Text section symbol (code)
 				addr := code_vmaddr + sym.value
 				sym_addrs[i] = addr
-				if !is_force_external {
+				if !is_external {
 					sym_name_to_addr[sym.name] = addr
 				}
 			} else if sym.sect == 2 {
 				// Cstring section symbol
 				addr := code_vmaddr + sym.value
 				sym_addrs[i] = addr
-				if !is_force_external {
+				if !is_external {
 					sym_name_to_addr[sym.name] = addr
 				}
 			} else if sym.sect == 3 {
@@ -821,7 +907,7 @@ fn (mut l Linker) write_text_with_relocations() {
 				// Subtract data base address to get offset within data_data array
 				addr := l.data_vmaddr + (sym.value - data_base_addr)
 				sym_addrs[i] = addr
-				if !is_force_external {
+				if !is_external {
 					sym_name_to_addr[sym.name] = addr
 				}
 			}
@@ -835,8 +921,9 @@ fn (mut l Linker) write_text_with_relocations() {
 			if addr := sym_name_to_addr[sym.name] {
 				// Resolve to local definition
 				sym_addrs[i] = addr
-			} else if got_idx := l.sym_to_got[sym.name] {
+			} else if sym.name in l.sym_to_got {
 				// External symbol - address is in stub
+				got_idx := l.sym_to_got[sym.name]
 				sym_addrs[i] = stubs_vmaddr + u64(got_idx * 12)
 			}
 		}
@@ -844,13 +931,14 @@ fn (mut l Linker) write_text_with_relocations() {
 
 	// Apply relocations
 	for r in l.macho.relocs {
-		// Check if this relocation references a force_external symbol
+		// Check if this relocation references an external symbol
 		// If so, redirect it to use the stub instead of the local definition
 		sym_name := l.macho.symbols[r.sym_idx].name
 		mut sym_addr := sym_addrs[r.sym_idx]
 		if sym_name in force_external_syms {
 			// Use stub address for force_external symbols
-			if got_idx := l.sym_to_got[sym_name] {
+			if sym_name in l.sym_to_got {
+				got_idx := l.sym_to_got[sym_name]
 				sym_addr = stubs_vmaddr + u64(got_idx * 12)
 			}
 		}
@@ -895,6 +983,33 @@ fn (mut l Linker) write_text_with_relocations() {
 					new_instr := (instr & 0xFFC003FF) | (u32(scaled_off) << 10)
 					write_u32_le_at_arr(mut text, r.addr, new_instr)
 				}
+			}
+			arm64_reloc_got_load_page21 {
+				// ADRP instruction: PC-relative page address to GOT entry
+				got_idx1 := l.sym_to_got[sym_name] or { 0 }
+				got_entry_addr1 := l.data_vmaddr + u64(l.got_offset) + u64(got_idx1 * 8)
+
+				got_page := i64(got_entry_addr1) & ~0xFFF
+				pc_page := i64(pc) & ~0xFFF
+				page_off := (got_page - pc_page) >> 12
+
+				immlo := u32(page_off & 0x3) << 29
+				immhi := u32((page_off >> 2) & 0x7FFFF) << 5
+				instr := read_u32_le(text, r.addr)
+				new_instr := (instr & 0x9F00001F) | immlo | immhi
+				write_u32_le_at_arr(mut text, r.addr, new_instr)
+			}
+			arm64_reloc_got_load_pageoff12 {
+				// LDR instruction: page offset to GOT entry
+				got_idx2 := l.sym_to_got[sym_name] or { 0 }
+				got_entry_addr2 := l.data_vmaddr + u64(l.got_offset) + u64(got_idx2 * 8)
+
+				page_off := got_entry_addr2 & 0xFFF
+				instr := read_u32_le(text, r.addr)
+				// LDR with scaled offset (8-byte scale for 64-bit load)
+				scaled_off := page_off >> 3
+				new_instr := (instr & 0xFFC003FF) | (u32(scaled_off) << 10)
+				write_u32_le_at_arr(mut text, r.addr, new_instr)
 			}
 			else {}
 		}

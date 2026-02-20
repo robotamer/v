@@ -3,8 +3,6 @@
 // that can be found in the LICENSE file.
 module types
 
-import v2.token
-
 pub type Object = Const | Fn | Global | Module | SmartCastSelector | Type
 
 // pub type Object = Const | Fn | Global | Module |
@@ -16,9 +14,11 @@ struct SmartCastSelector {
 	cast_type Type
 }
 
+@[heap]
 pub struct Scope {
+pub:
 	parent &Scope = unsafe { nil }
-mut:
+pub mut:
 	objects map[string]Object
 	// TODO: try implement using original concept
 	field_smartcasts map[string]Type
@@ -40,7 +40,7 @@ pub fn new_scope(parent &Scope) &Scope {
 
 // TODO: try implement the alternate method I was experimenting with (SmartCastSelector)
 // i'm not sure if it is actually possible though. need to explore it.
-pub fn (mut s Scope) lookup_field_smartcast(name string) ?Type {
+pub fn (s &Scope) lookup_field_smartcast(name string) ?Type {
 	mut scope := unsafe { s }
 	for ; scope != unsafe { nil }; scope = scope.parent {
 		if field_smartcast := scope.field_smartcasts[name] {
@@ -50,14 +50,14 @@ pub fn (mut s Scope) lookup_field_smartcast(name string) ?Type {
 	return none
 }
 
-pub fn (mut s Scope) lookup(name string) ?Object {
+pub fn (s &Scope) lookup(name string) ?Object {
 	if obj := s.objects[name] {
 		return obj
 	}
 	return none
 }
 
-pub fn (mut s Scope) lookup_parent(name string, pos token.Pos) ?Object {
+pub fn (s &Scope) lookup_parent(name string, pos int) ?Object {
 	mut scope := unsafe { s }
 	for ; scope != unsafe { nil }; scope = scope.parent {
 		if obj := scope.lookup(name) {
@@ -67,11 +67,20 @@ pub fn (mut s Scope) lookup_parent(name string, pos token.Pos) ?Object {
 			// }
 		}
 	}
-	// println('lookup_parent: NOT FOUND: $name')
+	// println('lookup_parent: NOT FOUND: ${name}')
 	return none
 }
 
-pub fn (mut s Scope) lookup_parent_with_scope(name string, pos token.Pos) ?(&Scope, Object) {
+// lookup_var_type looks up a variable by name and returns its type.
+// Walks up the scope chain to find the variable.
+pub fn (s &Scope) lookup_var_type(name string) ?Type {
+	if obj := s.lookup_parent(name, 0) {
+		return obj.typ()
+	}
+	return none
+}
+
+pub fn (s &Scope) lookup_parent_with_scope(name string, pos int) ?(&Scope, Object) {
 	mut scope := unsafe { s }
 	for ; scope != unsafe { nil }; scope = scope.parent {
 		if obj := scope.lookup(name) {
@@ -81,15 +90,15 @@ pub fn (mut s Scope) lookup_parent_with_scope(name string, pos token.Pos) ?(&Sco
 			// }
 		}
 	}
-	// println('lookup_parent: NOT FOUND: $name')
+	// println('lookup_parent: NOT FOUND: ${name}')
 	return none
 }
 
 pub fn (mut s Scope) insert(name string, obj Object) {
-	// println(' - register: $name: ${obj.type_name()}')
+	// println(' - register: ${name}: ${obj.type_name()}')
 	// TODO/FIXME:
 	// if name in s.objects {
-	// 	println(' #### EXISTS: $name')
+	// 	println(' #### EXISTS: ${name}')
 	// 	mut existing := s.objects[name] or { panic('should exist') }
 	// 	if mut existing is Type {
 	// 		if mut existing is Struct {
@@ -139,8 +148,7 @@ pub fn (obj &Object) typ() Type {
 			return obj.typ
 		}
 		Module {
-			// TODO:
-			println('#### got Module')
+			// TODO: modules don't have a type, return a placeholder
 			return Type(u16_)
 		}
 		SmartCastSelector {
@@ -149,8 +157,5 @@ pub fn (obj &Object) typ() Type {
 		Type {
 			return obj
 		}
-		// else {
-		// 	panic('missing obj.typ() for ${obj.type_name()}')
-		// }
 	}
 }

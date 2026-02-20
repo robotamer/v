@@ -782,6 +782,8 @@ fn (mut c Checker) struct_init(mut node ast.StructInit, is_field_zero_struct_ini
 				if exp_type_is_option && got_type.is_ptr() && !exp_type.is_ptr() {
 					c.error('cannot assign a pointer to option struct field', init_field.pos)
 				}
+				c.warn_if_integer_literal_overflow_for_known_type(exp_type, init_field.expr,
+					init_field.pos)
 				if exp_type_sym.kind == .voidptr {
 					if got_type_sym.kind == .struct && !got_type.is_ptr() {
 						c.error('allocate `${got_type_sym.name}` on the heap for use in other functions',
@@ -950,7 +952,7 @@ or use an explicit `unsafe{ a[..] }`, if you do not want a copy of the slice.',
 				c.check_uninitialized_struct_fields_and_embeds(node, type_sym, mut info, mut
 					inited_fields)
 			}
-			// println('>> checked_types.len: $checked_types.len | checked_types: $checked_types | type_sym: $type_sym.name ')
+			// println('>> checked_types.len: ${checked_types.len} | checked_types: ${checked_types} | type_sym: ${type_sym.name} ')
 		}
 		.sum_type {
 			first_typ := (type_sym.info as ast.SumType).variants[0]
@@ -1158,7 +1160,7 @@ fn (mut c Checker) check_uninitialized_struct_fields_and_embeds(node ast.StructI
 		/*
 		sym := c.table.sym(field.typ)
 		if sym.kind == .sum_type {
-			c.warn('sum type field `${type_sym.name}.$field.name` must be initialized',
+			c.warn('sum type field `${type_sym.name}.${field.name}` must be initialized',
 				node.pos)
 		}
 		*/

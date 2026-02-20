@@ -4,6 +4,7 @@
 module parser
 
 import v.ast
+import v.errors
 import v.token
 import v.util
 
@@ -142,7 +143,8 @@ fn (mut p Parser) struct_decl(is_anon bool) ast.StructDecl {
 		}
 		p.check(.lcbr)
 		// if p.is_vls && p.tok.kind == .key_struct { // p.tok.is_key() {
-		if p.is_vls && p.tok.is_key() && p.tok.kind != .key_mut {
+		if p.is_vls && p.tok.is_key() && !(p.tok.kind in [.key_pub, .key_mut]
+			&& p.peek_tok.kind in [.colon, .key_mut]) {
 			// End parsing after `struct Foo {` in vls mode to avoid lots of junk errors
 			// If next token after { is a key, the struct wasn't finished
 			p.error('expected `}` to finish a struct definition')
@@ -479,8 +481,35 @@ fn (mut p Parser) struct_decl(is_anon bool) ast.StructDecl {
 	}
 	// allow duplicate c struct declarations
 	if ret == -1 && language != .c && !p.pref.is_fmt {
-		p.error_with_pos('cannot register struct `${name}`, another type with this name exists',
-			name_pos)
+		msg := 'cannot register struct `${name}`, another type with this name exists'
+		mut existing_sym, mut existing_idx := p.table.find_sym_and_type_idx(name)
+		if existing_idx <= 0 && name.starts_with('main.') {
+			existing_sym, existing_idx = p.table.find_sym_and_type_idx(name.trim_string_left('main.'))
+		}
+		if existing_idx > 0 {
+			if existing_name_pos := existing_sym.info.get_name_pos() {
+				existing_file_path := if existing_name_pos.file_idx < 0 {
+					p.file_path
+				} else {
+					p.table.filelist[existing_name_pos.file_idx]
+				}
+				error_file_path := if name_pos.file_idx < 0 {
+					p.file_path
+				} else {
+					p.table.filelist[name_pos.file_idx]
+				}
+				p.error_with_error(errors.Error{
+					file_path: error_file_path
+					pos:       name_pos
+					reporter:  .parser
+					message:   msg
+					details:   util.formatted_error('details:', 'another declaration was found here',
+						existing_file_path, existing_name_pos)
+				})
+				return ast.StructDecl{}
+			}
+		}
+		p.error_with_pos(msg, name_pos)
 		return ast.StructDecl{}
 	}
 	p.expr_mod = ''

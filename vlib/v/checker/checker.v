@@ -309,7 +309,37 @@ pub fn (mut c Checker) check(mut ast_file ast.File) {
 
 	c.stmt_level = 0
 	for mut stmt in ast_file.stmts {
-		if stmt !in [ast.ConstDecl, ast.GlobalDecl, ast.ExprStmt] {
+		if stmt is ast.StructDecl || stmt is ast.InterfaceDecl || stmt is ast.EnumDecl
+			|| stmt is ast.TypeDecl {
+			c.expr_level = 0
+			c.stmt(mut stmt)
+		}
+		if c.should_abort {
+			return
+		}
+	}
+
+	c.stmt_level = 0
+	for mut stmt in ast_file.stmts {
+		if mut stmt is ast.FnDecl {
+			return_sym := c.table.sym(stmt.return_type)
+			if return_sym.info is ast.ArrayFixed
+				&& c.array_fixed_has_unresolved_size(return_sym.info) {
+				unsafe {
+					c.unresolved_fixed_sizes << &stmt
+				}
+			}
+		}
+	}
+
+	if c.unresolved_fixed_sizes.len > 0 {
+		c.update_unresolved_fixed_sizes()
+	}
+
+	c.stmt_level = 0
+	for mut stmt in ast_file.stmts {
+		if stmt !in [ast.ConstDecl, ast.GlobalDecl, ast.ExprStmt] && stmt !is ast.StructDecl
+			&& stmt !is ast.InterfaceDecl && stmt !is ast.EnumDecl && stmt !is ast.TypeDecl {
 			c.expr_level = 0
 			c.stmt(mut stmt)
 		}
@@ -365,7 +395,7 @@ pub fn (mut c Checker) check_scope_vars(sc &ast.Scope) {
 					}
 					// if obj.is_mut && !obj.is_changed && !c.is_builtin_mod && obj.name != 'it' {
 					// if obj.is_mut && !obj.is_changed && !c.is_builtin {  //TODO C error bad field not checked
-					// c.warn('`$obj.name` is declared as mutable, but it was never changed',
+					// c.warn('`${obj.name}` is declared as mutable, but it was never changed',
 					// obj.pos)
 					// }
 				}
@@ -945,7 +975,7 @@ fn (mut c Checker) sumtype_has_circular_ref(sum_typ ast.Type, target_typ ast.Typ
 }
 
 fn (mut c Checker) expand_iface_embeds(idecl &ast.InterfaceDecl, level int, iface_embeds []ast.InterfaceEmbedding) []ast.InterfaceEmbedding {
-	// eprintln('> expand_iface_embeds: idecl.name: $idecl.name | level: $level | iface_embeds.len: $iface_embeds.len')
+	// eprintln('> expand_iface_embeds: idecl.name: ${idecl.name} | level: ${level} | iface_embeds.len: ${iface_embeds.len}')
 	if level > iface_level_cutoff_limit {
 		c.error('too many interface embedding levels: ${level}, for interface `${idecl.name}`',
 			idecl.pos)
@@ -1297,7 +1327,7 @@ fn (mut c Checker) type_implements(typ ast.Type, interface_type ast.Type, pos to
 	utyp := c.unwrap_generic(typ)
 	styp := c.table.type_to_str(utyp)
 	typ_sym := c.table.sym(utyp)
-	mut inter_sym := c.table.sym(interface_type)
+	mut inter_sym := c.table.final_sym(interface_type)
 	if !inter_sym.is_pub && inter_sym.mod !in [typ_sym.mod, c.mod] && typ_sym.mod != 'builtin' {
 		c.error('`${styp}` cannot implement private interface `${inter_sym.name}` of other module',
 			pos)
@@ -1983,7 +2013,11 @@ fn (mut c Checker) selector_expr(mut node ast.SelectorExpr) ast.Type {
 			if !prevent_sum_type_unwrapping_once {
 				scope_field := node.scope.find_struct_field(node.expr.str(), typ, field_name)
 				if scope_field != unsafe { nil } {
-					return scope_field.smartcasts.last()
+					sf_smartcast_type := scope_field.smartcasts.last()
+					if c.inside_sql {
+						node.typ = sf_smartcast_type
+					}
+					return sf_smartcast_type
 				}
 			}
 		}
@@ -3683,7 +3717,7 @@ pub fn (mut c Checker) expr(mut node ast.Expr) ast.Type {
 // 			return c.table.bitsize_to_type(bit_size)
 // 		}
 // 	}
-// 	c.error('invalid register name: `$name`', node.pos)
+// 	c.error('invalid register name: `${name}`', node.pos)
 // 	return ast.void_type
 // }
 
@@ -4913,7 +4947,7 @@ fn (mut c Checker) smartcast(mut expr ast.Expr, cur_type ast.Type, to_type_ ast.
 					typ:               cur_type
 					pos:               expr.pos
 					is_used:           true
-					is_mut:            expr.is_mut
+					is_mut:            expr.is_mut || is_mut
 					is_inherited:      is_inherited
 					is_unwrapped:      is_option_unwrap
 					smartcasts:        smartcasts

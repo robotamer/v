@@ -8,7 +8,7 @@ module types
 const universe = init_universe()
 
 // primitives
-const bool_ = Primitive{
+pub const bool_ = Primitive{
 	props: .boolean
 }
 const i8_ = Primitive{
@@ -25,7 +25,7 @@ const i32_ = Primitive{
 }
 // TODO: represent platform specific size
 // will this be calculated at compile time?
-const int_ = Primitive{
+pub const int_ = Primitive{
 	props: .integer
 	// size: 32
 }
@@ -65,31 +65,31 @@ const f64_ = Primitive{
 // complex / non primitives
 // String struct is defined in cmd/v2/builtin/string.v:
 // pub struct string { str &u8, len int, is_lit int }
-const string_ = String(0)
+pub const string_ = String(0)
 const chan_ = Channel{}
 const char_ = Char(0)
 const isize_ = ISize(0)
 const usize_ = USize(0)
 const rune_ = Rune(0)
-const void_ = Void(0)
+pub const void_ = Void(0)
 const nil_ = Nil(0)
 const none_ = None(0)
 const byteptr_ = Alias{
 	name:      'byteptr'
 	base_type: Pointer{
-		base_type: byte_
+		base_type: Type(byte_)
 	}
 }
 const charptr_ = Alias{
 	name:      'charptr'
 	base_type: Pointer{
-		base_type: char_
+		base_type: Type(char_)
 	}
 }
-const voidptr_ = Alias{
+pub const voidptr_ = Alias{
 	name:      'voidptr'
 	base_type: Pointer{
-		base_type: void_
+		base_type: Type(void_)
 	}
 }
 const int_literal_ = Primitive{

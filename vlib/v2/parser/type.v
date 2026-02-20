@@ -32,20 +32,18 @@ fn (mut p Parser) try_type() ast.Expr {
 		// comptime type: `$enum` | `$struct` |  etc
 		.dollar {
 			p.next()
+			mut comptime_inner := ast.Expr(ast.empty_expr)
+			if p.tok == .name {
+				comptime_inner = ast.Expr(p.ident())
+			} else {
+				// TODO: match only allowed tokens otherwise error
+				comptime_inner = ast.Expr(ast.Ident{
+					pos:  p.pos
+					name: p.tok().str()
+				})
+			}
 			return ast.ComptimeExpr{
-				// TODO: best way to handle this?
-				expr: match p.tok {
-					.name {
-						p.ident()
-					}
-					else {
-						// TODO: match only allowed tokens otherwise error
-						ast.Ident{
-							pos:  p.pos
-							name: p.tok().str()
-						}
-					}
-				}
+				expr: comptime_inner
 			}
 		}
 		// variadic: `...type`
@@ -139,7 +137,7 @@ fn (mut p Parser) try_type() ast.Expr {
 				// TODO: is there a better solution than this. maybe it should be the
 				// concern of p.fn_parameters() & p.struct_decl() rather than this?
 				// `fn(param_a []type)` | `struct { field_a []type }`
-				if name is ast.Ident && name.name.len + pos < p.pos {
+				if name is ast.Ident && name.name.len + pos.offset < p.pos.offset {
 					return name
 				}
 				// TODO: using ast.GenericArgs here may not be correct,
@@ -169,7 +167,7 @@ fn (mut p Parser) try_type() ast.Expr {
 			})
 		}
 		else {
-			// return error('expecting type, got `$p.tok`')
+			// return error('expecting type, got `${p.tok}`')
 			return ast.empty_expr
 		}
 	}

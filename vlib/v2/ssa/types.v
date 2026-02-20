@@ -28,6 +28,7 @@ pub:
 	field_names []string // Field names for Structs
 	params      []TypeID // For Funcs
 	ret_type    TypeID
+	is_c_struct bool // True for C interop structs (use raw field names, typedef to C struct)
 }
 
 pub struct TypeStore {
@@ -44,7 +45,7 @@ pub fn TypeStore.new() &TypeStore {
 
 pub fn (mut ts TypeStore) get_int(width int) TypeID {
 	key := 'i${width}'
-	if id := ts.cache[key] {
+	if id := map_get_type_id(ts.cache, key) {
 		return id
 	}
 	id := ts.register(Type{ kind: .int_t, width: width })
@@ -54,7 +55,7 @@ pub fn (mut ts TypeStore) get_int(width int) TypeID {
 
 pub fn (mut ts TypeStore) get_float(width int) TypeID {
 	key := 'f${width}'
-	if id := ts.cache[key] {
+	if id := map_get_type_id(ts.cache, key) {
 		return id
 	}
 	id := ts.register(Type{ kind: .float_t, width: width })
@@ -64,7 +65,7 @@ pub fn (mut ts TypeStore) get_float(width int) TypeID {
 
 pub fn (mut ts TypeStore) get_ptr(elem TypeID) TypeID {
 	key := 'p${elem}'
-	if id := ts.cache[key] {
+	if id := map_get_type_id(ts.cache, key) {
 		return id
 	}
 	id := ts.register(Type{ kind: .ptr_t, elem_type: elem })
@@ -74,7 +75,7 @@ pub fn (mut ts TypeStore) get_ptr(elem TypeID) TypeID {
 
 pub fn (mut ts TypeStore) get_array(elem TypeID, length int) TypeID {
 	key := 'a${elem}_${length}'
-	if id := ts.cache[key] {
+	if id := map_get_type_id(ts.cache, key) {
 		return id
 	}
 	id := ts.register(Type{ kind: .array_t, elem_type: elem, len: length })
@@ -88,7 +89,7 @@ pub fn (mut ts TypeStore) get_tuple(elem_types []TypeID) TypeID {
 	for t in elem_types {
 		key += '_${t}'
 	}
-	if id := ts.cache[key] {
+	if id := map_get_type_id(ts.cache, key) {
 		return id
 	}
 	id := ts.register(Type{

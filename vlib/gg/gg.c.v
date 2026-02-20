@@ -27,9 +27,9 @@ struct C.XRRCrtcInfo {
 	height u32
 }
 
-fn C.XOpenDisplay(int) voidptr
-fn C.XCloseDisplay(voidptr) int
-fn C.DefaultScreen(voidptr) int
+fn C.XOpenDisplay(i32) voidptr
+fn C.XCloseDisplay(voidptr) i32
+fn C.DefaultScreen(voidptr) i32
 fn C.DefaultRootWindow(voidptr) u64
 fn C.XRRGetScreenResources(voidptr, u64) &C.XRRScreenResources
 fn C.XRRGetOutputPrimary(voidptr, u64) u64
@@ -52,7 +52,7 @@ $if windows {
 #flag wasm32_emscripten --embed-file @VEXEROOT/examples/assets/fonts/RobotoMono-Regular.ttf@/assets/fonts/RobotoMono-Regular.ttf
 
 // call Windows API to get screen size
-fn C.GetSystemMetrics(int) int
+fn C.GetSystemMetrics(i32) i32
 
 pub type TouchPoint = C.sapp_touchpoint
 
@@ -248,7 +248,7 @@ fn gg_init_sokol_window(user_data voidptr) {
 	// is_high_dpi := sapp.high_dpi()
 	// fb_w := sapp.width()
 	// fb_h := sapp.height()
-	// println('ctx.scale=$ctx.scale is_high_dpi=$is_high_dpi fb_w=$fb_w fb_h=$fb_h')
+	// println('ctx.scale=${ctx.scale} is_high_dpi=${is_high_dpi} fb_w=${fb_w} fb_h=${fb_h}')
 	// if ctx.config.init_text {
 	// `os.is_file()` won't work on Android if the font file is embedded into the APK
 	exists := $if !android { os.is_file(ctx.config.font_path) } $else { true }

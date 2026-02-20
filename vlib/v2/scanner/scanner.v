@@ -19,9 +19,9 @@ pub struct Scanner {
 	skip_interpolation bool
 mut:
 	file        &token.File = &token.File{}
-	src         string
 	insert_semi bool
 pub mut:
+	src    string
 	offset int // current char offset
 	pos    int // token offset (start of current token)
 	lit    string
@@ -47,9 +47,11 @@ pub fn (mut s Scanner) init(file &token.File, src string) {
 	s.offset = 0
 	s.pos = 0
 	s.lit = ''
-	// s.in_str_incomplete = false
-	// s.in_str_inter = false
-	// s.str_inter_cbr_depth = 0
+	s.insert_semi = false
+	s.in_str_incomplete = false
+	s.in_str_inter = false
+	s.str_inter_cbr_depth = 0
+	s.str_quote = 0
 	// init
 	s.file = unsafe { file }
 	s.src = src
@@ -57,6 +59,7 @@ pub fn (mut s Scanner) init(file &token.File, src string) {
 
 @[direct_array_access]
 pub fn (mut s Scanner) scan() token.Token {
+	// integrity check: detect source buffer corruption
 	// before whitespace call to keep whitespaces in string
 	// NOTE: before start: simply for a little more efficiency
 	// if !s.skip_interpolation && s.in_str_incomplete {
@@ -476,10 +479,21 @@ fn (mut s Scanner) comment() {
 fn (mut s Scanner) string_literal(scan_as_raw bool, c_quote u8) {
 	// shortcut, scan whole string
 	if scan_as_raw {
-		for s.offset < s.src.len && s.src[s.offset] != c_quote {
+		for s.offset < s.src.len {
+			c := s.src[s.offset]
+			if c == c_quote {
+				break
+			}
+			if c == `\n` {
+				s.offset++
+				s.file.add_line(s.offset)
+				continue
+			}
 			s.offset++
 		}
-		s.offset++
+		if s.offset < s.src.len {
+			s.offset++
+		}
 		return
 	}
 	// normal strings
@@ -555,7 +569,7 @@ fn (mut s Scanner) number() {
 			s.offset++
 			for {
 				c2 := s.src[s.offset]
-				if c2 >= `0` && c2 <= `7` {
+				if (c2 >= `0` && c2 <= `7`) || c2 == `_` {
 					s.offset++
 					continue
 				}
@@ -573,8 +587,9 @@ fn (mut s Scanner) number() {
 			s.offset++
 			continue
 		}
-		// fraction
-		else if !has_decimal && c == `.` && s.src[s.offset + 1] != `.` {
+		// fraction (only if next char after '.' is a digit, not a letter like '.hex()')
+		else if !has_decimal && c == `.` && s.src[s.offset + 1] != `.` && s.src[s.offset + 1] >= `0`
+			&& s.src[s.offset + 1] <= `9` {
 			has_decimal = true
 			s.offset++
 			continue
@@ -583,6 +598,10 @@ fn (mut s Scanner) number() {
 		else if !has_exponent && c in [`e`, `E`] {
 			has_exponent = true
 			s.offset++
+			// consume optional sign after exponent
+			if s.offset < s.src.len && s.src[s.offset] in [`+`, `-`] {
+				s.offset++
+			}
 			continue
 		}
 		break

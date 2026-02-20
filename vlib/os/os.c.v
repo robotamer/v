@@ -6,7 +6,9 @@ import strings
 #include <errno.h>
 
 $if macos {
-	#include <libproc.h>
+	#include <mach-o/dyld.h>
+	// needed for os.executable():
+	fn C._dyld_get_image_name(image u32) &char
 }
 
 $if freebsd || openbsd {
@@ -18,33 +20,33 @@ pub const args = arguments()
 
 fn C.readdir(voidptr) &C.dirent
 
-fn C.readlink(pathname &char, buf &char, bufsiz usize) int
+fn C.readlink(pathname &char, buf &char, bufsiz usize) i32
 
-fn C.getline(voidptr, voidptr, voidptr) int
+fn C.getline(voidptr, voidptr, voidptr) i32
 
-fn C.sigaction(int, voidptr, int) int
+fn C.sigaction(i32, voidptr, i32) i32
 
-fn C.open(&char, int, ...int) int
+fn C.open(&char, i32, ...int) i32
 
-fn C._wopen(&u16, int, ...int) int
+fn C._wopen(&u16, i32, ...int) i32
 
-fn C.fdopen(fd int, mode &char) &C.FILE
+fn C.fdopen(fd i32, mode &char) &C.FILE
 
-fn C.ferror(stream &C.FILE) int
+fn C.ferror(stream &C.FILE) i32
 
-fn C.feof(stream &C.FILE) int
+fn C.feof(stream &C.FILE) i32
 
-fn C.CopyFile(&u16, &u16, bool) int
+fn C.CopyFile(&u16, &u16, bool) i32
 
 // fn C.lstat(charptr, voidptr) u64
 
 fn C._wstat64(&u16, voidptr) u64
 
-fn C.chown(&char, int, int) int
+fn C.chown(&char, i32, i32) i32
 
-fn C.ftruncate(voidptr, u64) int
+fn C.ftruncate(voidptr, u64) i32
 
-fn C._chsize_s(voidptr, u64) int
+fn C._chsize_s(voidptr, u64) i32
 
 // read_bytes returns all bytes read from file in `path`.
 @[manualfree]
@@ -277,9 +279,9 @@ pub fn cp(src string, dst string, config CopyParams) ! {
 		// TODO: use defer{} to close files in case of error or return.
 		// Currently there is a C-Error when building.
 		mut buf := [1024]u8{}
-		mut count := 0
+		mut count := int(0)
 		for {
-			count = C.read(fp_from, &buf[0], sizeof(buf))
+			count = int(C.read(fp_from, &buf[0], sizeof(buf)))
 			if count == 0 {
 				break
 			}
@@ -765,14 +767,11 @@ pub fn executable() string {
 		return res
 	}
 	$if macos {
-		pid := C.getpid()
-		ret := C.proc_pidpath(pid, &result[0], max_path_len)
-		if ret <= 0 {
-			eprintln('os.executable() failed at calling proc_pidpath with pid: ${pid} . proc_pidpath returned ${ret} ')
+		self_path := &char(C._dyld_get_image_name(u32(0)))
+		if self_path == C.NULL {
 			return executable_fallback()
 		}
-		res := unsafe { tos_clone(&result[0]) }
-		return res
+		return unsafe { cstring_to_vstring(self_path) }
 	}
 	$if freebsd {
 		bufsize := usize(max_path_buffer_size)
@@ -861,18 +860,21 @@ pub fn chdir(path string) ! {
 @[manualfree]
 pub fn getwd() string {
 	unsafe {
-		buf := [max_path_buffer_size]u8{}
 		$if windows {
+			buf := [max_path_buffer_size]u8{}
 			if C._wgetcwd(&u16(&buf[0]), max_path_len) == 0 {
 				return ''
 			}
 			res := string_from_wide(&u16(&buf[0]))
 			return res
 		} $else {
-			if C.getcwd(&char(&buf[0]), max_path_len) == 0 {
+			// Use libc-managed buffer to avoid fixed-array address lowering pitfalls in v2.
+			cwd_ptr := C.getcwd(0, 4096)
+			if cwd_ptr == 0 {
 				return ''
 			}
-			res := tos_clone(&buf[0])
+			res := tos_clone(byteptr(cwd_ptr))
+			C.free(cwd_ptr)
 			return res
 		}
 	}

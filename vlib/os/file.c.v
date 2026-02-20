@@ -28,11 +28,11 @@ pub mut:
 	is_opened bool
 }
 
-fn C.fseeko(&C.FILE, u64, int) int
+fn C.fseeko(&C.FILE, u64, i32) i32
 
-fn C._fseeki64(&C.FILE, u64, int) int
+fn C._fseeki64(&C.FILE, u64, i32) i32
 
-fn C.getc(&C.FILE) int
+fn C.getc(&C.FILE) i32
 
 fn C.freopen(&char, &char, &C.FILE) &C.FILE
 
@@ -128,7 +128,7 @@ pub fn open(path string) !File {
 		$if !android {
 			fd := C.syscall(sys_open, path.str, 511)
 			if fd == -1 {
-				return error('failed to open file "$path"')
+				return error('failed to open file "${path}"')
 			}
 			return File{
 				fd: fd

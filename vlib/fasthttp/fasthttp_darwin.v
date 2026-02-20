@@ -12,12 +12,12 @@ const buf_size = max_connection_size
 const kqueue_max_events = 128
 const backlog = max_connection_size
 
-fn C.kevent(kq int, changelist &C.kevent, nchanges int, eventlist &C.kevent, nevents int, timeout &C.timespec) int
-fn C.kqueue() int
-fn C.fstat(fd int, buf &C.stat) int
+fn C.kevent(kq i32, changelist &C.kevent, nchanges i32, eventlist &C.kevent, nevents i32, timeout &C.timespec) i32
+fn C.kqueue() i32
+fn C.fstat(fd i32, buf &C.stat) i32
 
 // int sendfile(int fd, int s, off_t offset, off_t *len, struct sf_hdtr *hdtr, int flags);
-fn C.sendfile(fd int, s int, offset i64, len &i64, hdtr voidptr, flags int) int
+fn C.sendfile(fd i32, s i32, offset i64, len &i64, hdtr voidptr, flags i32) i32
 
 struct C.kevent {
 	ident  u64
@@ -55,19 +55,23 @@ mut:
 
 pub struct Server {
 pub mut:
-	port            int
-	socket_fd       int
-	poll_fd         int // kqueue fd
-	user_data       voidptr
-	request_handler fn (HttpRequest) !HttpResponse @[required]
+	family                  net.AddrFamily = .ip6
+	port                    int
+	max_request_buffer_size int = 8192
+	socket_fd               int
+	poll_fd                 int // kqueue fd
+	user_data               voidptr
+	request_handler         fn (HttpRequest) !HttpResponse @[required]
 }
 
 // new_server creates and initializes a new Server instance.
 pub fn new_server(config ServerConfig) !&Server {
 	mut server := &Server{
-		port:            config.port
-		user_data:       config.user_data
-		request_handler: config.handler
+		family:                  config.family
+		port:                    config.port
+		max_request_buffer_size: config.max_request_buffer_size
+		user_data:               config.user_data
+		request_handler:         config.handler
 	}
 	return server
 }
@@ -272,7 +276,7 @@ fn accept_clients(kq int, listen_fd int) {
 
 // run starts the server and enters the main event loop (Kqueue version).
 pub fn (mut s Server) run() ! {
-	s.socket_fd = C.socket(net.AddrFamily.ip, net.SocketType.tcp, 0)
+	s.socket_fd = C.socket(s.family, net.SocketType.tcp, 0)
 	if s.socket_fd < 0 {
 		C.perror(c'socket')
 		return error('socket creation failed')
@@ -281,7 +285,11 @@ pub fn (mut s Server) run() ! {
 	opt := 1
 	C.setsockopt(s.socket_fd, C.SOL_SOCKET, C.SO_REUSEADDR, &opt, sizeof(int))
 
-	addr := net.new_ip(u16(s.port), [u8(0), 0, 0, 0]!)
+	addr := if s.family == .ip6 {
+		net.new_ip6(u16(s.port), [u8(0), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]!)
+	} else {
+		net.new_ip(u16(s.port), [u8(0), 0, 0, 0]!)
+	}
 	alen := addr.len()
 
 	if C.bind(s.socket_fd, voidptr(&addr), alen) < 0 {
@@ -304,7 +312,7 @@ pub fn (mut s Server) run() ! {
 	add_event(s.poll_fd, u64(s.socket_fd), i16(C.EVFILT_READ), u16(C.EV_ADD | C.EV_ENABLE | C.EV_CLEAR),
 		unsafe { nil })
 
-	println('listening on http://localhost:${s.port}/')
+	println('listening on http://0.0.0.0:${s.port}/')
 
 	mut events := [kqueue_max_events]C.kevent{}
 	for {

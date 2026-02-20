@@ -4,6 +4,8 @@
 
 module ssa
 
+import v2.types
+
 pub struct TargetData {
 pub:
 	ptr_size      int
@@ -17,12 +19,22 @@ pub mut:
 	target     TargetData
 	type_store TypeStore
 
+	// Type checker environment (optional, for backends that need rich type info)
+	env &types.Environment = unsafe { nil }
+
 	// Arenas
 	values  []Value
 	instrs  []Instruction
 	blocks  []BasicBlock
 	funcs   []Function
 	globals []GlobalVar
+
+	// C struct names: TypeID -> C struct name (e.g., 114 -> "stat" for struct stat)
+	// Used by the C gen to emit `typedef struct <name> Struct_N;` instead of
+	// generating a custom struct definition that would have the wrong memory layout.
+	c_struct_names map[int]string
+	// C structs marked with @[typedef] – already a C typedef, not a struct tag.
+	c_typedef_structs map[int]bool
 
 	// Constant cache: (type, name) -> ValueID for deduplication
 	const_cache map[string]ValueID
@@ -94,7 +106,7 @@ pub fn (mut m Module) add_value_node(kind ValueKind, typ TypeID, name string, in
 // This maintains SSA's immutability principle by avoiding duplicate constants.
 pub fn (mut m Module) get_or_add_const(typ TypeID, name string) ValueID {
 	key := '${typ}:${name}'
-	if existing := m.const_cache[key] {
+	if existing := map_get_value_id(m.const_cache, key) {
 		return existing
 	}
 	id := m.add_value_node(.constant, typ, name, 0)
@@ -143,12 +155,37 @@ pub fn (mut m Module) add_global_with_value(name string, typ TypeID, is_const bo
 	g := GlobalVar{
 		name:          name
 		typ:           typ
+		linkage:       .private // Local global, not external
 		is_constant:   is_const
 		initial_value: initial_value
 	}
 	m.globals << g
 
 	// FIX: The Value representing a global is a POINTER to the data
+	ptr_typ := m.type_store.get_ptr(typ)
+	return m.add_value_node(.global, ptr_typ, name, id)
+}
+
+// add_external_global adds an external global variable (defined outside this module)
+// Returns the ValueID for the global pointer
+pub fn (mut m Module) add_external_global(name string, typ TypeID) ValueID {
+	// Check if this external global already exists
+	for v in m.values {
+		if v.kind == .global && v.name == name {
+			return v.id
+		}
+	}
+
+	// Create a new external global
+	id := m.globals.len
+	g := GlobalVar{
+		name:    name
+		typ:     typ
+		linkage: .external
+	}
+	m.globals << g
+
+	// The Value representing a global is a POINTER to the data
 	ptr_typ := m.type_store.get_ptr(typ)
 	return m.add_value_node(.global, ptr_typ, name, id)
 }
